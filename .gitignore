@@ -1,0 +1,16 @@
+dist
+/dist/
+/dist-*/
+build
+/build/
+/build-*/
+node_modules
+/node_modules/
+.env
+.env.local
+.env.*.local
+.DS_Store
+.vscode
+/.vscode/
+.idea
+/got-soup-data-macos/
