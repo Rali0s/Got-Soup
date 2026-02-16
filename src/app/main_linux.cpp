@@ -1,3 +1,4 @@
+#include <cstdio>
 #include <iostream>
 
 #include "core/api/core_api.hpp"
@@ -30,9 +31,30 @@ std::string soup_address_from_cid(std::string_view cid) {
   return std::string{alpha::kAddressPrefix} + digest.substr(0, 39);
 }
 
-std::string basil_leaf_summary(std::int64_t basil_units) {
-  const std::int64_t leafs = basil_units * alpha::kLeafsPerBasil;
-  return std::to_string(basil_units) + " " + std::string{alpha::kCurrencyMajorName} + " " +
+std::string format_leaf_amount_as_basil(std::int64_t leaf_units) {
+  const bool negative = leaf_units < 0;
+  std::uint64_t abs_leafs = static_cast<std::uint64_t>(negative ? -leaf_units : leaf_units);
+  const std::uint64_t whole = abs_leafs / static_cast<std::uint64_t>(alpha::kLeafsPerBasil);
+  std::string out = (negative ? "-" : "") + std::to_string(whole);
+  std::uint64_t frac = abs_leafs % static_cast<std::uint64_t>(alpha::kLeafsPerBasil);
+  if (frac != 0) {
+    char buf[9];
+    std::snprintf(buf, sizeof(buf), "%08llu", static_cast<unsigned long long>(frac));
+    std::string frac_str = buf;
+    while (!frac_str.empty() && frac_str.back() == '0') {
+      frac_str.pop_back();
+    }
+    if (!frac_str.empty()) {
+      out += ".";
+      out += frac_str;
+    }
+  }
+  return out;
+}
+
+std::string basil_leaf_summary(std::int64_t leaf_units) {
+  const std::int64_t leafs = leaf_units;
+  return format_leaf_amount_as_basil(leaf_units) + " " + std::string{alpha::kCurrencyMajorName} + " " +
          std::string{alpha::kCurrencyMajorSymbol} + " (" + std::to_string(leafs) + " " +
          std::string{alpha::kCurrencyMinorName} + " " + std::string{alpha::kCurrencyMinorSymbol} + ")";
 }
@@ -98,7 +120,7 @@ void fill_texts(AppContext* ctx) {
   about_text += "Authors: " + std::string{alpha::kAuthorList} + "\n\n";
   about_text += "Currency: " + std::string{alpha::kCurrencyMajorName} + " (1.0 " +
                 std::string{alpha::kCurrencyMajorSymbol} + "), " + std::string{alpha::kCurrencyMinorName} +
-                " (0.0000000001 " + std::string{alpha::kCurrencyMinorSymbol} + ")\n";
+                " (0.00000001 " + std::string{alpha::kCurrencyMinorSymbol} + ")\n";
   about_text += "Address Prefix: " + std::string{alpha::kAddressPrefix} + "\n\n";
   about_text += "Assets\n";
   about_text += "- About PNG: " + node.data_dir + "/assets/about.png\n";

@@ -1,10 +1,14 @@
 #import <Cocoa/Cocoa.h>
 
 #include <algorithm>
+#include <cctype>
 #include <charconv>
+#include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -31,15 +35,79 @@ std::string soup_address_from_cid(std::string_view cid) {
   return std::string{alpha::kAddressPrefix} + alpha::util::sha256_like_hex(cid).substr(0, 39);
 }
 
-std::string basil_leaf_summary(std::int64_t basil_units) {
-  const std::int64_t leafs = basil_units * alpha::kLeafsPerBasil;
-  return std::to_string(basil_units) + " " + std::string{alpha::kCurrencyMajorName} + " " +
+std::string format_leaf_amount_as_basil(std::int64_t leaf_units) {
+  const bool negative = leaf_units < 0;
+  std::uint64_t abs_leafs = static_cast<std::uint64_t>(negative ? -leaf_units : leaf_units);
+  const std::uint64_t whole = abs_leafs / static_cast<std::uint64_t>(alpha::kLeafsPerBasil);
+  std::string out = (negative ? "-" : "") + std::to_string(whole);
+  std::uint64_t frac = abs_leafs % static_cast<std::uint64_t>(alpha::kLeafsPerBasil);
+  if (frac != 0) {
+    char buf[9];
+    std::snprintf(buf, sizeof(buf), "%08llu", static_cast<unsigned long long>(frac));
+    std::string frac_str = buf;
+    while (!frac_str.empty() && frac_str.back() == '0') {
+      frac_str.pop_back();
+    }
+    if (!frac_str.empty()) {
+      out += ".";
+      out += frac_str;
+    }
+  }
+  return out;
+}
+
+std::optional<std::int64_t> parse_basil_amount_to_leafs(std::string_view input) {
+  std::string text;
+  text.reserve(input.size());
+  for (char c : input) {
+    if (!std::isspace(static_cast<unsigned char>(c))) {
+      text.push_back(c);
+    }
+  }
+  if (text.empty() || text.front() == '-') {
+    return std::nullopt;
+  }
+
+  const std::size_t dot = text.find('.');
+  const std::string whole_part = text.substr(0, dot);
+  const std::string frac_part = (dot == std::string::npos) ? "" : text.substr(dot + 1);
+  if (whole_part.empty() || whole_part.find_first_not_of("0123456789") != std::string::npos ||
+      frac_part.find_first_not_of("0123456789") != std::string::npos || frac_part.size() > 8 ||
+      text.find('.', dot == std::string::npos ? 0 : dot + 1) != std::string::npos) {
+    return std::nullopt;
+  }
+
+  std::int64_t whole = 0;
+  const auto whole_parse = std::from_chars(whole_part.data(), whole_part.data() + whole_part.size(), whole);
+  if (whole_parse.ec != std::errc()) {
+    return std::nullopt;
+  }
+  if (whole > (std::numeric_limits<std::int64_t>::max() / alpha::kLeafsPerBasil)) {
+    return std::nullopt;
+  }
+
+  std::string frac_padded = frac_part;
+  frac_padded.append(8U - frac_padded.size(), '0');
+  std::int64_t frac = 0;
+  if (!frac_padded.empty()) {
+    const auto frac_parse = std::from_chars(frac_padded.data(), frac_padded.data() + frac_padded.size(), frac);
+    if (frac_parse.ec != std::errc()) {
+      return std::nullopt;
+    }
+  }
+
+  return whole * alpha::kLeafsPerBasil + frac;
+}
+
+std::string basil_leaf_summary(std::int64_t leaf_units) {
+  const std::int64_t leafs = leaf_units;
+  return format_leaf_amount_as_basil(leaf_units) + " " + std::string{alpha::kCurrencyMajorName} + " " +
          std::string{alpha::kCurrencyMajorSymbol} + " (" + std::to_string(leafs) + " " +
          std::string{alpha::kCurrencyMinorName} + " " + std::string{alpha::kCurrencyMinorSymbol} + ")";
 }
 
-std::string compact_basil_amount(std::int64_t basil_units) {
-  return std::to_string(basil_units) + " " + std::string{alpha::kCurrencyMajorSymbol};
+std::string compact_basil_amount(std::int64_t leaf_units) {
+  return format_leaf_amount_as_basil(leaf_units) + " " + std::string{alpha::kCurrencyMajorSymbol};
 }
 
 std::string default_app_data_dir() {
@@ -275,7 +343,7 @@ bool write_developer_mode_flag(const std::string& file_path, bool enabled) {
   about += "Currency\n";
   about += "- " + std::string{alpha::kCurrencyMajorName} + " (1.0 " +
            std::string{alpha::kCurrencyMajorSymbol} + ")\n";
-  about += "- " + std::string{alpha::kCurrencyMinorName} + " (0.0000000001 " +
+  about += "- " + std::string{alpha::kCurrencyMinorName} + " (0.00000001 " +
            std::string{alpha::kCurrencyMinorSymbol} + ")\n";
   about += "- Address Prefix: " + std::string{alpha::kAddressPrefix} + "\n\n";
   about += "Credits\n";
@@ -1117,7 +1185,7 @@ bool write_developer_mode_flag(const std::string& file_path, bool enabled) {
   [send_view addSubview:_send_address_field];
 
   _send_amount_field = [[NSTextField alloc] initWithFrame:NSMakeRect(0.0, frame.size.height - 56.0, 180.0, 24.0)];
-  [_send_amount_field setPlaceholderString:@"Amount (Basil units)"];
+  [_send_amount_field setPlaceholderString:@"Amount (Basil, up to 8 decimals)"];
   [_send_amount_field setAutoresizingMask:NSViewMaxXMargin | NSViewMinYMargin];
   [send_view addSubview:_send_amount_field];
 
@@ -1874,16 +1942,15 @@ bool write_developer_mode_flag(const std::string& file_path, bool enabled) {
     return;
   }
 
-  std::int64_t amount = 0;
-  const auto parsed = std::from_chars(amount_text.data(), amount_text.data() + amount_text.size(), amount);
-  if (parsed.ec != std::errc() || amount <= 0) {
-    show_error_alert(_window, "Send", "Amount must be a positive integer.");
+  const auto amount = parse_basil_amount_to_leafs(amount_text);
+  if (!amount.has_value() || *amount <= 0) {
+    show_error_alert(_window, "Send", "Amount must be a positive Basil value (up to 8 decimals).");
     return;
   }
 
   const alpha::Result result = _api->transfer_rewards_to_address({
       .to_address = address,
-      .amount = amount,
+      .amount = *amount,
       .memo = memo,
   });
   if (!result.ok) {

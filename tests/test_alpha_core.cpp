@@ -11,6 +11,7 @@
 #include "core/crypto/crypto.hpp"
 #include "core/storage/store.hpp"
 #include "core/util/canonical.hpp"
+#include "core/util/hash.hpp"
 
 namespace {
 
@@ -81,6 +82,65 @@ void test_store_materialization() {
   assert(health.event_count == 1);
   assert(store.next_claim_reward(1) == 115);
   assert(store.next_claim_reward(24193) == 110);  // per-block exponential decay
+}
+
+void test_store_rollback_on_duplicate_reward_claim_conflict() {
+  alpha::Store store;
+  const auto dir = temp_dir("store-rollback-duplicate-claim");
+
+  alpha::Result open = store.open(dir.string(), "vault-key");
+  assert(open.ok);
+
+  store.set_block_timing(1);
+  const std::int64_t now = alpha::util::unix_timestamp_now();
+  alpha::Result block_check = store.routine_block_check(now + 5);
+  assert(block_check.ok);
+
+  const std::uint64_t claimed_block = 4;
+  const std::int64_t reward = store.next_claim_reward(claimed_block);
+  assert(reward > 0);
+
+  auto make_claim = [&](std::string_view event_id, std::string_view author, std::string_view nonce) {
+    const std::string pow_material = "claim|" + std::to_string(claimed_block) + "|" + std::string{author} + "|" +
+                                     std::to_string(now);
+    const std::string pow_hash = alpha::util::sha256_like_hex(pow_material + "|" + std::string{nonce});
+    const std::string witness = alpha::util::sha256_like_hex(std::string{author} + "|" +
+                                                              std::to_string(claimed_block) + "|" +
+                                                              std::to_string(reward) + "|" + pow_hash);
+
+    alpha::EventEnvelope event;
+    event.event_id = std::string{event_id};
+    event.kind = alpha::EventKind::BlockRewardClaimed;
+    event.author_cid = std::string{author};
+    event.unix_ts = now;
+    event.payload = alpha::util::canonical_join({
+        {"block_index", std::to_string(claimed_block)},
+        {"reward", std::to_string(reward)},
+        {"pow_difficulty", "1"},
+        {"pow_nonce", std::string{nonce}},
+        {"pow_hash", pow_hash},
+        {"pow_material", pow_material},
+        {"witness_root", witness},
+    });
+    event.signature = "sig";
+    return event;
+  };
+
+  alpha::Result append = store.append_event(make_claim("evt-claim-1", "cid-a", "1"));
+  assert(append.ok);
+  append = store.append_event(make_claim("evt-claim-2", "cid-b", "2"));
+  assert(append.ok);
+
+  auto health = store.health_report();
+  assert(health.invalid_economic_event_count >= 1);
+
+  const alpha::Result rollback = store.rollback_to_last_checkpoint("duplicate reward claim in test");
+  assert(rollback.ok);
+
+  health = store.health_report();
+  assert(health.invalid_economic_event_count == 0);
+  assert(store.all_events().empty());
+  assert(store.all_blocks().size() >= 1);
 }
 
 void test_core_api_flow() {
@@ -693,6 +753,7 @@ void test_moderation_controls() {
 int main() {
   test_crypto_signatures();
   test_store_materialization();
+  test_store_rollback_on_duplicate_reward_claim_conflict();
   test_core_api_flow();
   test_forum_reference_sync();
   test_node_status_toggles_and_alpha_mode();

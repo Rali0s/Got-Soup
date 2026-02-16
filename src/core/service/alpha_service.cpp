@@ -162,6 +162,10 @@ bool should_rebuild_local_store(std::string_view message) {
          message.find("Event ID mismatch") != std::string_view::npos;
 }
 
+bool has_duplicate_reward_claim_error(std::string_view message) {
+  return message.find("Duplicate reward claim for block.") != std::string_view::npos;
+}
+
 Result quarantine_and_reset_store_dir(std::string_view app_data_dir, std::string_view store_dir,
                                       std::string_view reason) {
   std::error_code ec;
@@ -1491,6 +1495,17 @@ Result AlphaService::use_community_profile(std::string_view community_or_path,
   }
 
   Result validation = run_backtest_validation();
+  if (!validation.ok && has_duplicate_reward_claim_error(validation.message)) {
+    const Result rollback = store_.rollback_to_last_checkpoint("duplicate reward-claim conflict");
+    if (!rollback.ok) {
+      return rollback;
+    }
+    const Result rebuilt_block_check = store_.routine_block_check(util::unix_timestamp_now());
+    if (!rebuilt_block_check.ok) {
+      return rebuilt_block_check;
+    }
+    validation = run_backtest_validation();
+  }
   if (!validation.ok && should_rebuild_local_store(validation.message)) {
     const Result reset =
         quarantine_and_reset_store_dir(config_.app_data_dir, effective_store_path, validation.message);

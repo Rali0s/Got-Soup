@@ -1821,6 +1821,108 @@ Result Store::persist_event(const EventEnvelope& event) const {
   return Result::success();
 }
 
+Result Store::persist_event_log() const {
+  std::ofstream out(event_log_path_, std::ios::out | std::ios::trunc);
+  if (!out) {
+    return Result::failure("Failed to rewrite event log file.");
+  }
+
+  for (const auto& event : events_) {
+    out << serialize_event_line(event);
+  }
+
+  if (!out.good()) {
+    return Result::failure("Failed flushing rewritten event log file.");
+  }
+
+  return Result::success();
+}
+
+Result Store::rollback_to_last_checkpoint(std::string_view reason) {
+  ensure_genesis_block(util::unix_timestamp_now());
+
+  const std::optional<std::uint64_t> confirmed_tip = latest_confirmed_block_index();
+  std::uint64_t checkpoint_index = 0;
+  if (confirmed_tip.has_value()) {
+    for (const auto& block : blocks_) {
+      if (!block.confirmed) {
+        continue;
+      }
+      if (chain_policy_.checkpoint_interval_blocks > 0 &&
+          (block.index % chain_policy_.checkpoint_interval_blocks) != 0U) {
+        continue;
+      }
+      const std::uint64_t confirmations = (*confirmed_tip >= block.index) ? ((*confirmed_tip - block.index) + 1U) : 0U;
+      if (confirmations < chain_policy_.checkpoint_confirmations) {
+        continue;
+      }
+      checkpoint_index = std::max(checkpoint_index, block.index);
+    }
+  }
+
+  std::vector<BlockRecord> retained_blocks;
+  retained_blocks.reserve(blocks_.size());
+  std::unordered_set<std::string> retained_event_ids;
+  for (const auto& block : blocks_) {
+    if (block.index > checkpoint_index) {
+      continue;
+    }
+    retained_blocks.push_back(block);
+    for (const auto& event_id : block.event_ids) {
+      retained_event_ids.insert(event_id);
+    }
+  }
+
+  if (retained_blocks.empty()) {
+    BlockRecord genesis;
+    genesis.index = 0;
+    genesis.opened_unix = util::unix_timestamp_now();
+    genesis.reserved = true;
+    genesis.confirmed = false;
+    genesis.backfilled = false;
+    genesis.psz_timestamp = genesis_psz_timestamp_;
+    retained_blocks.push_back(std::move(genesis));
+  }
+
+  events_.erase(std::remove_if(events_.begin(), events_.end(), [&retained_event_ids](const EventEnvelope& event) {
+                  return !retained_event_ids.contains(event.event_id);
+                }),
+                events_.end());
+  blocks_ = std::move(retained_blocks);
+
+  rebuild_event_to_block_index();
+  recompute_block_hashes();
+
+  const Result materialized = materialize_views();
+  if (!materialized.ok) {
+    return materialized;
+  }
+
+  const Result persist_events = persist_event_log();
+  if (!persist_events.ok) {
+    return persist_events;
+  }
+  const Result persist_blocks = persist_block_log();
+  if (!persist_blocks.ok) {
+    return persist_blocks;
+  }
+  const Result persist_checkpoints_result = persist_checkpoints();
+  if (!persist_checkpoints_result.ok) {
+    return persist_checkpoints_result;
+  }
+  const Result snapshot = persist_snapshot();
+  if (!snapshot.ok) {
+    return snapshot;
+  }
+
+  std::ostringstream msg;
+  msg << "Rolled back chain to checkpoint block " << checkpoint_index;
+  if (!reason.empty()) {
+    msg << " (" << reason << ")";
+  }
+  return Result::success(msg.str());
+}
+
 Result Store::load_block_log() {
   blocks_.clear();
   event_to_block_.clear();

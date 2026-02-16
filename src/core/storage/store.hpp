@@ -48,6 +48,7 @@ public:
   Result routine_block_check(std::int64_t now_unix);
   Result backtest_validate(const std::function<std::string(std::string_view)>& content_id_fn,
                            std::string_view expected_community_id);
+  Result rollback_to_last_checkpoint(std::string_view reason);
 
   [[nodiscard]] std::vector<RecipeSummary> query_recipes(const SearchQuery& query) const;
   [[nodiscard]] std::vector<ThreadSummary> query_threads(std::string_view recipe_id) const;
@@ -128,6 +129,7 @@ private:
 
   Result load_event_log();
   Result persist_event(const EventEnvelope& event) const;
+  Result persist_event_log() const;
   Result load_block_log();
   Result persist_block_log() const;
   Result persist_snapshot();

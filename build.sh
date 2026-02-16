@@ -23,6 +23,13 @@ if [[ "$profile" != "22" && "$profile" != "24" ]]; then
   exit 1
 fi
 
+release_version="$(sed -nE 's/^project\(.* VERSION ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' CMakeLists.txt | head -n1)"
+if [[ -z "$release_version" ]]; then
+  echo "Unable to detect release version from CMakeLists.txt" >&2
+  exit 1
+fi
+echo "Building SoupNet Mainnet release v$release_version"
+
 ensure_mingw_in_path() {
   if command -v x86_64-w64-mingw32-g++ >/dev/null 2>&1; then
     return
