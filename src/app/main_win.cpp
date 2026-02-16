@@ -2,17 +2,20 @@
 #include <commctrl.h>
 
 #include <algorithm>
+#include <charconv>
+#include <fstream>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include "core/api/core_api.hpp"
 #include "core/model/app_meta.hpp"
+#include "core/util/hash.hpp"
 
 namespace {
 
 constexpr wchar_t kWindowClassName[] = L"GotSoupMainWindow";
-constexpr wchar_t kWindowTitle[] = L"got-soup::P2P Tomato Soup - Recipe Forum";
+constexpr wchar_t kWindowTitle[] = L"SoupNet::P2P Tomato Soup - Recipe Forum";
 
 constexpr int kSearchEditId = 1001;
 constexpr int kCloseButtonId = 1002;
@@ -62,6 +65,17 @@ constexpr int kSettingsRecoverBackupPassId = 1059;
 constexpr int kSettingsRecoverLocalPassId = 1060;
 constexpr int kSettingsRecoverWalletId = 1061;
 constexpr int kSettingsValidateNowId = 1062;
+constexpr int kSettingsDevModeToggleId = 1073;
+constexpr int kSendAddressEditId = 1063;
+constexpr int kSendAmountEditId = 1064;
+constexpr int kSendMemoEditId = 1065;
+constexpr int kSendButtonId = 1066;
+constexpr int kReceiveViewId = 1067;
+constexpr int kTransactionsViewId = 1068;
+constexpr int kSignMessageEditId = 1069;
+constexpr int kSignButtonId = 1070;
+constexpr int kSignatureOutputId = 1071;
+constexpr int kHashSpecViewId = 1072;
 constexpr int kAboutViewId = 1020;
 constexpr int kNodeStatusViewId = 1021;
 constexpr int kNodeTorToggleId = 1022;
@@ -85,9 +99,13 @@ enum class TabIndex : int {
   Upload = 2,
   Profile = 3,
   Rewards = 4,
-  NodeStatus = 5,
-  Settings = 6,
-  About = 7,
+  Send = 5,
+  Receive = 6,
+  Transactions = 7,
+  HashSpec = 8,
+  NodeStatus = 9,
+  Settings = 10,
+  About = 11,
 };
 
 struct AppState {
@@ -136,6 +154,16 @@ struct AppState {
   HWND profile_import_button = nullptr;
   HWND profile_nuke_button = nullptr;
   HWND rewards_view = nullptr;
+  HWND send_address_edit = nullptr;
+  HWND send_amount_edit = nullptr;
+  HWND send_memo_edit = nullptr;
+  HWND send_button = nullptr;
+  HWND receive_view = nullptr;
+  HWND transactions_view = nullptr;
+  HWND sign_message_edit = nullptr;
+  HWND sign_button = nullptr;
+  HWND signature_output_view = nullptr;
+  HWND hashspec_view = nullptr;
   HWND about_view = nullptr;
   HWND settings_view = nullptr;
   HWND settings_lock_wallet_button = nullptr;
@@ -146,6 +174,7 @@ struct AppState {
   HWND settings_recover_local_password_edit = nullptr;
   HWND settings_recover_wallet_button = nullptr;
   HWND settings_validate_now_button = nullptr;
+  HWND settings_dev_mode_toggle_button = nullptr;
 
   HWND node_status_view = nullptr;
   HWND node_tor_toggle = nullptr;
@@ -159,6 +188,9 @@ struct AppState {
   HWND node_community_id_edit = nullptr;
   HWND node_community_name_edit = nullptr;
   HWND node_community_apply_button = nullptr;
+
+  bool developer_mode = false;
+  std::string ui_mode_file_path;
 };
 
 std::wstring utf8_to_wide(std::string_view text) {
@@ -193,6 +225,29 @@ std::string wide_to_utf8(const std::wstring& text) {
   WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), out.data(), required,
                       nullptr, nullptr);
   return out;
+}
+
+bool read_developer_mode_flag(const std::string& file_path) {
+  std::ifstream in(file_path);
+  if (!in.is_open()) {
+    return false;
+  }
+  std::string line;
+  while (std::getline(in, line)) {
+    if (line == "developer=1") {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool write_developer_mode_flag(const std::string& file_path, bool enabled) {
+  std::ofstream out(file_path, std::ios::trunc);
+  if (!out.is_open()) {
+    return false;
+  }
+  out << "developer=" << (enabled ? "1" : "0") << "\n";
+  return static_cast<bool>(out);
 }
 
 std::wstring read_window_text(HWND control) {
@@ -256,10 +311,29 @@ void set_combo_to_mode(HWND combo, alpha::AnonymityMode mode) {
   }
 }
 
+std::string soup_address_from_cid(std::string_view cid) {
+  if (cid.empty()) {
+    return std::string{alpha::kAddressPrefix};
+  }
+  return std::string{alpha::kAddressPrefix} + alpha::util::sha256_like_hex(cid).substr(0, 39);
+}
+
+std::string basil_leaf_summary(std::int64_t basil_units) {
+  const std::int64_t leafs = basil_units * alpha::kLeafsPerBasil;
+  return std::to_string(basil_units) + " " + std::string{alpha::kCurrencyMajorName} + " " +
+         std::string{alpha::kCurrencyMajorSymbol} + " (" + std::to_string(leafs) + " " +
+         std::string{alpha::kCurrencyMinorName} + " " + std::string{alpha::kCurrencyMinorSymbol} + ")";
+}
+
+std::string compact_basil_amount(std::int64_t basil_units) {
+  return std::to_string(basil_units) + " " + std::string{alpha::kCurrencyMajorSymbol};
+}
+
 std::string build_about_text(const AppState* state) {
   const auto node = state->api.node_status();
   const std::string about_png = node.data_dir + "/assets/about.png";
   const std::string splash_png = node.data_dir + "/assets/tomato_soup.png";
+  const std::string leaf_png = node.data_dir + "/assets/leaf_icon.png";
 
   std::string about_text;
   about_text += std::string{alpha::kAppDisplayName} + "\r\n\r\n";
@@ -268,13 +342,22 @@ std::string build_about_text(const AppState* state) {
   about_text += "Current P2P:Soup Version Build Release: " + std::string{alpha::kAppVersion} +
                 " (" + std::string{alpha::kBuildRelease} + ")\r\n";
   about_text += "Authors: " + std::string{alpha::kAuthorList} + "\r\n\r\n";
+  about_text += "Currency\r\n";
+  about_text += "- " + std::string{alpha::kCurrencyMajorName} + " (1.0 " +
+                std::string{alpha::kCurrencyMajorSymbol} + ")\r\n";
+  about_text += "- " + std::string{alpha::kCurrencyMinorName} + " (0.0000000001 " +
+                std::string{alpha::kCurrencyMinorSymbol} + ")\r\n";
+  about_text += "- Address Prefix: " + std::string{alpha::kAddressPrefix} + "\r\n\r\n";
   about_text += "Credits\r\n";
   about_text += "- Core: C++23 modular alpha_core\r\n";
   about_text += "- UI: Native Win32 / Cocoa / GTK path\r\n";
   about_text += "- Planned deps: libp2p, libsodium, SQLCipher, libtor, i2pd\r\n\r\n";
+  about_text += "Reference\r\n";
+  about_text += "- https://github.com/hendrayoga/smallchange\r\n\r\n";
   about_text += "Assets\r\n";
   about_text += "- About PNG (transparent): " + about_png + "\r\n";
-  about_text += "- Splash PNG: " + splash_png + "\r\n\r\n";
+  about_text += "- Splash PNG: " + splash_png + "\r\n";
+  about_text += "- Leaf Icon PNG: " + leaf_png + "\r\n\r\n";
   about_text += "Chain\r\n";
   about_text += "- Chain ID: " + node.genesis.chain_id + "\r\n";
   about_text += "- Network: " + node.genesis.network_id + "\r\n";
@@ -301,6 +384,8 @@ void refresh_profile_and_about(AppState* state) {
 
   std::string profile_text;
   profile_text += "CID: " + profile.cid.value + "\r\n";
+  profile_text += std::string{alpha::kNetworkDisplayName} + " Address: " + soup_address_from_cid(profile.cid.value) +
+                  "\r\n";
   profile_text += "Display Name: " + profile.display_name + "\r\n\r\n";
   profile_text += "Display Name State: ";
   profile_text += (profile.display_name_immortalized ? "IMMORTALIZED" : "not set");
@@ -314,6 +399,7 @@ void refresh_profile_and_about(AppState* state) {
   profile_text += "Bio:\r\n" + profile.bio_markdown + "\r\n\r\n";
   profile_text += "Community: " + node.community.community_id + "\r\n";
   profile_text += "Community Profile: " + node.community.profile_path + "\r\n";
+  profile_text += "Balance: " + basil_leaf_summary(node.local_reward_balance) + "\r\n";
   profile_text += "Active Transport: ";
   profile_text += (node.active_mode == alpha::AnonymityMode::I2P ? "I2P" : "Tor");
   profile_text += "\r\n";
@@ -422,6 +508,9 @@ void refresh_recipe_list(AppState* state) {
 }
 
 void refresh_rewards_view(AppState* state);
+void refresh_send_receive_views(AppState* state);
+void refresh_transactions_view(AppState* state);
+void refresh_hashspec_view(AppState* state);
 void refresh_settings_view(AppState* state);
 
 void refresh_node_status_view(AppState* state) {
@@ -496,13 +585,13 @@ void refresh_node_status_view(AppState* state) {
   text += " | Reserved: " + std::to_string(node.db.reserved_block_count);
   text += " | Confirmed: " + std::to_string(node.db.confirmed_block_count);
   text += " | Backfilled: " + std::to_string(node.db.backfilled_block_count) + "\r\n";
-  text += "Rewards: supply=" + std::to_string(node.db.reward_supply);
-  text += " | local=" + std::to_string(node.local_reward_balance);
+  text += "Rewards: supply=" + basil_leaf_summary(node.db.reward_supply);
+  text += " | local=" + basil_leaf_summary(node.local_reward_balance);
   text += " | claims=" + std::to_string(node.db.reward_claim_event_count);
   text += " | transfers=" + std::to_string(node.db.reward_transfer_event_count) + "\r\n";
-  text += "Issued=" + std::to_string(node.db.issued_reward_total);
-  text += " | Burned=" + std::to_string(node.db.burned_fee_total);
-  text += " | Cap=" + std::to_string(node.db.max_token_supply) + "\r\n";
+  text += "Issued=" + basil_leaf_summary(node.db.issued_reward_total);
+  text += " | Burned=" + basil_leaf_summary(node.db.burned_fee_total);
+  text += " | Cap=" + basil_leaf_summary(node.db.max_token_supply) + "\r\n";
   text += "Invalid economic events: " + std::to_string(node.db.invalid_economic_event_count) + "\r\n";
   text += "Dropped invalid events: " + std::to_string(node.db.invalid_event_drop_count) + "\r\n";
   text += "Block interval (sec): " + std::to_string(node.db.block_interval_seconds) + "\r\n";
@@ -556,40 +645,91 @@ void refresh_node_status_view(AppState* state) {
 
   set_edit_text(state->node_status_view, text);
   refresh_rewards_view(state);
+  refresh_send_receive_views(state);
+  refresh_transactions_view(state);
+  refresh_hashspec_view(state);
   refresh_settings_view(state);
 }
 
 void refresh_rewards_view(AppState* state) {
   const auto node = state->api.node_status();
+  const auto transactions = state->api.reward_transactions();
+  const std::int64_t available = node.local_reward_balance;
+  const std::int64_t pending = 0;
+  const std::int64_t total = available + pending;
 
   std::string text;
-  text += "Rewards (PoW)\r\n\r\n";
-  text += "Network: " + node.p2p.network + "\r\n";
-  text += "Block Interval (sec): " + std::to_string(node.db.block_interval_seconds) + "\r\n";
-  text += "Genesis pszTimestamp: " + node.db.genesis_psz_timestamp + "\r\n";
-  text += "Latest Merkle Root: " + node.db.latest_merkle_root + "\r\n\r\n";
-
-  text += "Tokenomics\r\n";
-  text += "Max Supply: " + std::to_string(node.db.max_token_supply) + "\r\n";
-  text += "Issued: " + std::to_string(node.db.issued_reward_total) + "\r\n";
-  text += "Burned Fees: " + std::to_string(node.db.burned_fee_total) + "\r\n";
-  text += "Circulating: " + std::to_string(node.db.reward_supply) + "\r\n";
-  text += "Local Balance: " + std::to_string(node.local_reward_balance) + "\r\n\r\n";
-
-  text += "PoW Claims\r\n";
-  text += "Reward Claim Events: " + std::to_string(node.db.reward_claim_event_count) + "\r\n";
-  text += "Transfer Events: " + std::to_string(node.db.reward_transfer_event_count) + "\r\n";
-  text += "Invalid Economic Events: " + std::to_string(node.db.invalid_economic_event_count) + "\r\n";
-  text += "Finality Threshold: " + std::to_string(node.db.confirmation_threshold) + "\r\n";
-  text += "Mining occurs automatically in sync ticks for confirmed unclaimed blocks.\r\n\r\n";
-
+  text += "Wallet\r\n\r\n";
   text += "Balances\r\n";
-  for (const auto& balance : node.reward_balances) {
-    std::string label = balance.display_name.empty() ? balance.cid : balance.display_name + " (" + balance.cid + ")";
-    text += "- " + label + ": " + std::to_string(balance.balance) + "\r\n";
+  text += "Available: " + compact_basil_amount(available) + "\r\n";
+  text += "Pending: " + compact_basil_amount(pending) + "\r\n";
+  text += "Total: " + compact_basil_amount(total) + "\r\n\r\n";
+
+  text += "Recent transactions\r\n";
+  if (transactions.empty()) {
+    text += "No recent transactions.\r\n";
+  } else {
+    const std::size_t limit = std::min<std::size_t>(transactions.size(), 12U);
+    for (std::size_t i = 0; i < limit; ++i) {
+      const auto& tx = transactions[i];
+      const bool outgoing = tx.amount < 0;
+      text += outgoing ? "- " : "+ ";
+      text += compact_basil_amount(outgoing ? -tx.amount : tx.amount);
+      text += "  unix:" + std::to_string(tx.unix_ts) + "\r\n";
+      text += "  conf:" + std::to_string(tx.confirmation_count);
+      text += " fee:" + compact_basil_amount(tx.fee) + "\r\n";
+      if (!tx.to_address.empty()) {
+        text += "  to: " + tx.to_address + "\r\n";
+      }
+      if (!tx.from_address.empty()) {
+        text += "  from: " + tx.from_address + "\r\n";
+      }
+      text += "\r\n";
+    }
   }
 
   set_edit_text(state->rewards_view, text);
+}
+
+void refresh_send_receive_views(AppState* state) {
+  const auto receive = state->api.receive_info();
+
+  std::string receive_text;
+  receive_text += "Receive\r\n\r\n";
+  receive_text += "Display Name: " + receive.display_name + "\r\n";
+  receive_text += "CID: " + receive.cid + "\r\n";
+  receive_text += "Address: " + receive.address + "\r\n\r\n";
+  receive_text += "PubKey:\r\n" + receive.public_key + "\r\n\r\n";
+  receive_text += "PrivKey:\r\n" + receive.private_key + "\r\n";
+  set_edit_text(state->receive_view, receive_text);
+}
+
+void refresh_transactions_view(AppState* state) {
+  const auto transactions = state->api.reward_transactions();
+  std::string text;
+  text += "Transactions History\r\n\r\n";
+  if (transactions.empty()) {
+    text += "No transfer events found.\r\n";
+    set_edit_text(state->transactions_view, text);
+    return;
+  }
+
+  for (const auto& tx : transactions) {
+    text += "- TxID: " + tx.transfer_id + "\r\n";
+    text += "  Event: " + tx.event_id + "\r\n";
+    text += "  From: " + tx.from_address + "\r\n";
+    text += "  To: " + tx.to_address + "\r\n";
+    text += "  Amount: " + basil_leaf_summary(tx.amount) + "\r\n";
+    text += "  Fee Burn: " + basil_leaf_summary(tx.fee) + "\r\n";
+    text += "  Memo: " + tx.memo + "\r\n";
+    text += "  Unix: " + std::to_string(tx.unix_ts) + "\r\n";
+    text += "  Confirmations: " + std::to_string(tx.confirmation_count) + "\r\n\r\n";
+  }
+  set_edit_text(state->transactions_view, text);
+}
+
+void refresh_hashspec_view(AppState* state) {
+  set_edit_text(state->hashspec_view, state->api.hashspec_console());
 }
 
 void refresh_settings_view(AppState* state) {
@@ -627,6 +767,9 @@ void refresh_settings_view(AppState* state) {
   text += "Max event bytes: " + std::to_string(node.validation_limits.max_event_bytes) + "\r\n";
   text += "Future drift seconds: " + std::to_string(node.validation_limits.max_future_drift_seconds) + "\r\n";
   text += "Past drift seconds: " + std::to_string(node.validation_limits.max_past_drift_seconds) + "\r\n\r\n";
+  text += "UI Mode: ";
+  text += (state->developer_mode ? "Developer" : "User Friendly");
+  text += " (restart required after change)\r\n\r\n";
 
   text += "Genesis Spec\r\n";
   text += "Chain ID: " + node.genesis.chain_id + "\r\n";
@@ -639,6 +782,8 @@ void refresh_settings_view(AppState* state) {
     text += "- " + seed + "\r\n";
   }
 
+  SetWindowTextW(state->settings_dev_mode_toggle_button,
+                 state->developer_mode ? L"Disable Developer Mode (Reboot)" : L"Enable Developer Mode (Reboot)");
   set_edit_text(state->settings_view, text);
 }
 
@@ -706,20 +851,29 @@ void refresh_tab_visibility(AppState* state) {
     ShowWindow(control, visible ? SW_SHOW : SW_HIDE);
   };
 
+  show(state->search_edit, state->developer_mode);
+  show(state->parent_menu, state->developer_mode);
+  show(state->secondary_menu, state->developer_mode);
+  show(state->opening_list, state->developer_mode);
+
   const bool is_recipes = tab_index == static_cast<int>(TabIndex::Recipes);
   const bool is_forum = tab_index == static_cast<int>(TabIndex::Forum);
   const bool is_upload = tab_index == static_cast<int>(TabIndex::Upload);
   const bool is_profile = tab_index == static_cast<int>(TabIndex::Profile);
   const bool is_rewards = tab_index == static_cast<int>(TabIndex::Rewards);
+  const bool is_send = tab_index == static_cast<int>(TabIndex::Send);
+  const bool is_receive = tab_index == static_cast<int>(TabIndex::Receive);
+  const bool is_transactions = tab_index == static_cast<int>(TabIndex::Transactions);
+  const bool is_hashspec = tab_index == static_cast<int>(TabIndex::HashSpec);
   const bool is_node = tab_index == static_cast<int>(TabIndex::NodeStatus);
   const bool is_settings = tab_index == static_cast<int>(TabIndex::Settings);
   const bool is_about = tab_index == static_cast<int>(TabIndex::About);
 
   show(state->recipes_list, is_recipes);
   show(state->recipe_detail, is_recipes);
-  show(state->recipe_thumb_up, is_recipes);
-  show(state->recipe_rate_combo, is_recipes);
-  show(state->recipe_rate_button, is_recipes);
+  show(state->recipe_thumb_up, is_recipes && state->developer_mode);
+  show(state->recipe_rate_combo, is_recipes && state->developer_mode);
+  show(state->recipe_rate_button, is_recipes && state->developer_mode);
 
   show(state->forum_view, is_forum);
   show(state->forum_thread_title, is_forum);
@@ -728,53 +882,64 @@ void refresh_tab_visibility(AppState* state) {
   show(state->forum_reply_body, is_forum);
   show(state->forum_create_reply, is_forum);
 
-  show(state->upload_title, is_upload);
-  show(state->upload_category, is_upload);
-  show(state->upload_body, is_upload);
-  show(state->upload_submit, is_upload);
+  show(state->upload_title, is_upload && state->developer_mode);
+  show(state->upload_category, is_upload && state->developer_mode);
+  show(state->upload_body, is_upload && state->developer_mode);
+  show(state->upload_submit, is_upload && state->developer_mode);
 
   show(state->profile_view, is_profile);
-  show(state->profile_name_edit, is_profile);
-  show(state->profile_set_name_button, is_profile);
-  show(state->profile_duplicate_policy_toggle, is_profile);
-  show(state->profile_apply_policy_button, is_profile);
-  show(state->profile_cipher_password_edit, is_profile);
-  show(state->profile_cipher_salt_edit, is_profile);
-  show(state->profile_cipher_apply_button, is_profile);
-  show(state->profile_update_key_button, is_profile);
-  show(state->profile_export_path_edit, is_profile);
-  show(state->profile_export_password_edit, is_profile);
-  show(state->profile_export_salt_edit, is_profile);
-  show(state->profile_export_button, is_profile);
-  show(state->profile_import_path_edit, is_profile);
-  show(state->profile_import_password_edit, is_profile);
-  show(state->profile_import_button, is_profile);
-  show(state->profile_nuke_button, is_profile);
+  show(state->profile_name_edit, is_profile && state->developer_mode);
+  show(state->profile_set_name_button, is_profile && state->developer_mode);
+  show(state->profile_duplicate_policy_toggle, is_profile && state->developer_mode);
+  show(state->profile_apply_policy_button, is_profile && state->developer_mode);
+  show(state->profile_cipher_password_edit, is_profile && state->developer_mode);
+  show(state->profile_cipher_salt_edit, is_profile && state->developer_mode);
+  show(state->profile_cipher_apply_button, is_profile && state->developer_mode);
+  show(state->profile_update_key_button, is_profile && state->developer_mode);
+  show(state->profile_export_path_edit, is_profile && state->developer_mode);
+  show(state->profile_export_password_edit, is_profile && state->developer_mode);
+  show(state->profile_export_salt_edit, is_profile && state->developer_mode);
+  show(state->profile_export_button, is_profile && state->developer_mode);
+  show(state->profile_import_path_edit, is_profile && state->developer_mode);
+  show(state->profile_import_password_edit, is_profile && state->developer_mode);
+  show(state->profile_import_button, is_profile && state->developer_mode);
+  show(state->profile_nuke_button, is_profile && state->developer_mode);
 
   show(state->rewards_view, is_rewards);
+  show(state->send_address_edit, is_send && state->developer_mode);
+  show(state->send_amount_edit, is_send && state->developer_mode);
+  show(state->send_memo_edit, is_send && state->developer_mode);
+  show(state->send_button, is_send && state->developer_mode);
+  show(state->sign_message_edit, is_send && state->developer_mode);
+  show(state->sign_button, is_send && state->developer_mode);
+  show(state->signature_output_view, is_send && state->developer_mode);
+  show(state->receive_view, is_receive);
+  show(state->transactions_view, is_transactions);
+  show(state->hashspec_view, is_hashspec);
 
   show(state->node_status_view, is_node);
-  show(state->node_tor_toggle, is_node);
-  show(state->node_i2p_toggle, is_node);
-  show(state->node_localhost_toggle, is_node);
-  show(state->node_mode_combo, is_node);
-  show(state->node_apply_button, is_node);
-  show(state->node_refresh_button, is_node);
-  show(state->node_peer_edit, is_node);
-  show(state->node_peer_add_button, is_node);
-  show(state->node_community_id_edit, is_node);
-  show(state->node_community_name_edit, is_node);
-  show(state->node_community_apply_button, is_node);
+  show(state->node_tor_toggle, is_node && state->developer_mode);
+  show(state->node_i2p_toggle, is_node && state->developer_mode);
+  show(state->node_localhost_toggle, is_node && state->developer_mode);
+  show(state->node_mode_combo, is_node && state->developer_mode);
+  show(state->node_apply_button, is_node && state->developer_mode);
+  show(state->node_refresh_button, is_node && state->developer_mode);
+  show(state->node_peer_edit, is_node && state->developer_mode);
+  show(state->node_peer_add_button, is_node && state->developer_mode);
+  show(state->node_community_id_edit, is_node && state->developer_mode);
+  show(state->node_community_name_edit, is_node && state->developer_mode);
+  show(state->node_community_apply_button, is_node && state->developer_mode);
 
   show(state->settings_view, is_settings);
-  show(state->settings_lock_wallet_button, is_settings);
-  show(state->settings_unlock_password_edit, is_settings);
-  show(state->settings_unlock_wallet_button, is_settings);
-  show(state->settings_recover_path_edit, is_settings);
-  show(state->settings_recover_backup_password_edit, is_settings);
-  show(state->settings_recover_local_password_edit, is_settings);
-  show(state->settings_recover_wallet_button, is_settings);
-  show(state->settings_validate_now_button, is_settings);
+  show(state->settings_lock_wallet_button, is_settings && state->developer_mode);
+  show(state->settings_unlock_password_edit, is_settings && state->developer_mode);
+  show(state->settings_unlock_wallet_button, is_settings && state->developer_mode);
+  show(state->settings_recover_path_edit, is_settings && state->developer_mode);
+  show(state->settings_recover_backup_password_edit, is_settings && state->developer_mode);
+  show(state->settings_recover_local_password_edit, is_settings && state->developer_mode);
+  show(state->settings_recover_wallet_button, is_settings && state->developer_mode);
+  show(state->settings_validate_now_button, is_settings && state->developer_mode);
+  show(state->settings_dev_mode_toggle_button, is_settings);
 
   show(state->about_view, is_about);
 }
@@ -791,7 +956,7 @@ void layout_controls(AppState* state, int width, int height) {
   MoveWindow(state->search_edit, margin, margin, search_width, top_height, TRUE);
   MoveWindow(state->close_button, margin * 2 + search_width, margin, close_width, top_height, TRUE);
 
-  const int body_y = margin + top_height + margin;
+  const int body_y = state->developer_mode ? (margin + top_height + margin) : margin;
   const int body_h = std::max(120, height - body_y - margin);
 
   MoveWindow(state->parent_menu, margin, body_y, left_width, combo_height, TRUE);
@@ -802,7 +967,7 @@ void layout_controls(AppState* state, int width, int height) {
   const int opening_h = std::max(80, body_h - (combo_height * 2) - (section_gap * 2));
   MoveWindow(state->opening_list, margin, opening_y, left_width, opening_h, TRUE);
 
-  const int tab_x = margin * 2 + left_width;
+  const int tab_x = state->developer_mode ? (margin * 2 + left_width) : margin;
   const int tab_w = std::max(260, width - tab_x - margin);
   const int tab_h = body_h;
   MoveWindow(state->tab_control, tab_x, body_y, tab_w, tab_h, TRUE);
@@ -929,9 +1094,22 @@ void layout_controls(AppState* state, int width, int height) {
   MoveWindow(state->settings_recover_wallet_button, tab_rect.left + std::max(140, page_w - 420) + 264,
              settings_top + 30, 90, 24, TRUE);
   MoveWindow(state->settings_validate_now_button, tab_rect.left + 438, settings_top, 110, 24, TRUE);
+  MoveWindow(state->settings_dev_mode_toggle_button, tab_rect.left + 554, settings_top, 240, 24, TRUE);
   MoveWindow(state->settings_view, tab_rect.left, settings_top + 60, page_w, std::max(80, page_h - 60), TRUE);
 
+  const int send_top = tab_rect.top;
+  MoveWindow(state->send_address_edit, tab_rect.left, send_top, std::max(240, page_w - 130), 24, TRUE);
+  MoveWindow(state->send_amount_edit, tab_rect.left, send_top + 30, 160, 24, TRUE);
+  MoveWindow(state->send_button, tab_rect.left + 168, send_top + 30, 120, 24, TRUE);
+  MoveWindow(state->send_memo_edit, tab_rect.left, send_top + 60, page_w, 24, TRUE);
+  MoveWindow(state->sign_message_edit, tab_rect.left, send_top + 96, std::max(240, page_w - 130), 24, TRUE);
+  MoveWindow(state->sign_button, tab_rect.left + std::max(240, page_w - 130) + 8, send_top + 96, 120, 24, TRUE);
+  MoveWindow(state->signature_output_view, tab_rect.left, send_top + 126, page_w, std::max(80, page_h - 126), TRUE);
+
   MoveWindow(state->rewards_view, tab_rect.left, tab_rect.top, page_w, page_h, TRUE);
+  MoveWindow(state->receive_view, tab_rect.left, tab_rect.top, page_w, page_h, TRUE);
+  MoveWindow(state->transactions_view, tab_rect.left, tab_rect.top, page_w, page_h, TRUE);
+  MoveWindow(state->hashspec_view, tab_rect.left, tab_rect.top, page_w, page_h, TRUE);
   MoveWindow(state->about_view, tab_rect.left, tab_rect.top, page_w, page_h, TRUE);
 
   refresh_tab_visibility(state);
@@ -1308,6 +1486,60 @@ void validate_now_from_ui(HWND hwnd, AppState* state) {
   refresh_node_status_view(state);
 }
 
+void send_rewards_to_address_from_ui(HWND hwnd, AppState* state) {
+  const std::string address = wide_to_utf8(read_window_text(state->send_address_edit));
+  const std::string amount_text = wide_to_utf8(read_window_text(state->send_amount_edit));
+  const std::string memo = wide_to_utf8(read_window_text(state->send_memo_edit));
+  if (address.empty() || amount_text.empty()) {
+    MessageBoxW(hwnd, L"Address and amount are required.", L"Send", MB_OK | MB_ICONWARNING);
+    return;
+  }
+
+  std::int64_t amount = 0;
+  const auto parsed = std::from_chars(amount_text.data(), amount_text.data() + amount_text.size(), amount);
+  if (parsed.ec != std::errc() || amount <= 0) {
+    MessageBoxW(hwnd, L"Amount must be a positive integer.", L"Send", MB_OK | MB_ICONWARNING);
+    return;
+  }
+
+  const alpha::Result result = state->api.transfer_rewards_to_address({
+      .to_address = address,
+      .amount = amount,
+      .memo = memo,
+  });
+  if (!result.ok) {
+    show_result_if_error(hwnd, result, L"Send");
+    return;
+  }
+
+  SetWindowTextW(state->send_amount_edit, L"");
+  SetWindowTextW(state->send_memo_edit, L"");
+  refresh_node_status_view(state);
+  refresh_profile_and_about(state);
+  refresh_transactions_view(state);
+  MessageBoxW(hwnd, L"Transfer broadcast queued.", L"Send", MB_OK | MB_ICONINFORMATION);
+}
+
+void sign_message_from_ui(HWND hwnd, AppState* state) {
+  const std::string message = wide_to_utf8(read_window_text(state->sign_message_edit));
+  if (message.empty()) {
+    MessageBoxW(hwnd, L"Message is required.", L"Sign Message", MB_OK | MB_ICONWARNING);
+    return;
+  }
+
+  const auto signed_msg = state->api.sign_message(message);
+  std::string output;
+  output += "Message:\r\n" + signed_msg.message + "\r\n\r\n";
+  output += "Signature:\r\n" + signed_msg.signature + "\r\n\r\n";
+  output += "Address: " + signed_msg.address + "\r\n";
+  output += "CID: " + signed_msg.cid + "\r\n";
+  output += "PubKey:\r\n" + signed_msg.public_key + "\r\n";
+  output += "Wallet Locked: ";
+  output += signed_msg.wallet_locked ? "YES" : "NO";
+  output += "\r\n";
+  set_edit_text(state->signature_output_view, output);
+}
+
 LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_param) {
   auto* state = reinterpret_cast<AppState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
 
@@ -1354,7 +1586,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_p
 
       TCITEMW tab{};
       tab.mask = TCIF_TEXT;
-      std::wstring recipes = L"Recipes";
+      std::wstring recipes = L"Home";
       tab.pszText = recipes.data();
       TabCtrl_InsertItem(state->tab_control, static_cast<int>(TabIndex::Recipes), &tab);
       std::wstring forum = L"Forum";
@@ -1366,10 +1598,22 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_p
       std::wstring profile = L"Profile";
       tab.pszText = profile.data();
       TabCtrl_InsertItem(state->tab_control, static_cast<int>(TabIndex::Profile), &tab);
-      std::wstring rewards = L"Rewards";
+      std::wstring rewards = L"Wallet";
       tab.pszText = rewards.data();
       TabCtrl_InsertItem(state->tab_control, static_cast<int>(TabIndex::Rewards), &tab);
-      std::wstring node = L"Node Status";
+      std::wstring send = L"Send";
+      tab.pszText = send.data();
+      TabCtrl_InsertItem(state->tab_control, static_cast<int>(TabIndex::Send), &tab);
+      std::wstring receive = L"Receive";
+      tab.pszText = receive.data();
+      TabCtrl_InsertItem(state->tab_control, static_cast<int>(TabIndex::Receive), &tab);
+      std::wstring transactions = L"Transactions";
+      tab.pszText = transactions.data();
+      TabCtrl_InsertItem(state->tab_control, static_cast<int>(TabIndex::Transactions), &tab);
+      std::wstring hashspec = L"HashSpec";
+      tab.pszText = hashspec.data();
+      TabCtrl_InsertItem(state->tab_control, static_cast<int>(TabIndex::HashSpec), &tab);
+      std::wstring node = L"Status";
       tab.pszText = node.data();
       TabCtrl_InsertItem(state->tab_control, static_cast<int>(TabIndex::NodeStatus), &tab);
       std::wstring settings = L"Settings";
@@ -1530,6 +1774,48 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_p
                                                            ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY,
                           0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(kRewardsViewId), create->hInstance,
                           nullptr);
+      state->send_address_edit =
+          CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"SoupNet Address (starts with S)",
+                          WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 0, 0, 0, 0, hwnd,
+                          reinterpret_cast<HMENU>(kSendAddressEditId), create->hInstance, nullptr);
+      state->send_amount_edit =
+          CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"Amount (Basil units)",
+                          WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 0, 0, 0, 0, hwnd,
+                          reinterpret_cast<HMENU>(kSendAmountEditId), create->hInstance, nullptr);
+      state->send_button =
+          CreateWindowW(L"BUTTON", L"Send Basil/Leafs", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0,
+                        hwnd, reinterpret_cast<HMENU>(kSendButtonId), create->hInstance, nullptr);
+      state->send_memo_edit =
+          CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"Memo (optional)",
+                          WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 0, 0, 0, 0, hwnd,
+                          reinterpret_cast<HMENU>(kSendMemoEditId), create->hInstance, nullptr);
+      state->sign_message_edit =
+          CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"Message to sign",
+                          WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 0, 0, 0, 0, hwnd,
+                          reinterpret_cast<HMENU>(kSignMessageEditId), create->hInstance, nullptr);
+      state->sign_button =
+          CreateWindowW(L"BUTTON", L"Sign Message", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd,
+                        reinterpret_cast<HMENU>(kSignButtonId), create->hInstance, nullptr);
+      state->signature_output_view =
+          CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_VSCROLL |
+                                                           ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY,
+                          0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(kSignatureOutputId), create->hInstance,
+                          nullptr);
+      state->receive_view =
+          CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_VSCROLL |
+                                                           ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY,
+                          0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(kReceiveViewId), create->hInstance,
+                          nullptr);
+      state->transactions_view =
+          CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_VSCROLL |
+                                                           ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY,
+                          0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(kTransactionsViewId), create->hInstance,
+                          nullptr);
+      state->hashspec_view =
+          CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_VSCROLL |
+                                                           ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY,
+                          0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(kHashSpecViewId), create->hInstance,
+                          nullptr);
 
       state->node_status_view =
           CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_VSCROLL |
@@ -1617,6 +1903,10 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_p
           CreateWindowW(L"BUTTON", L"Validate Now", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0,
                         hwnd, reinterpret_cast<HMENU>(kSettingsValidateNowId), create->hInstance,
                         nullptr);
+      state->settings_dev_mode_toggle_button =
+          CreateWindowW(L"BUTTON", L"Enable Developer Mode (Reboot)", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                        0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(kSettingsDevModeToggleId),
+                        create->hInstance, nullptr);
 
       const HWND controls[] = {
           state->search_edit,
@@ -1658,6 +1948,16 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_p
           state->profile_import_button,
           state->profile_nuke_button,
           state->rewards_view,
+          state->send_address_edit,
+          state->send_amount_edit,
+          state->send_memo_edit,
+          state->send_button,
+          state->sign_message_edit,
+          state->sign_button,
+          state->signature_output_view,
+          state->receive_view,
+          state->transactions_view,
+          state->hashspec_view,
           state->about_view,
           state->node_status_view,
           state->node_tor_toggle,
@@ -1680,6 +1980,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_p
           state->settings_recover_local_password_edit,
           state->settings_recover_wallet_button,
           state->settings_validate_now_button,
+          state->settings_dev_mode_toggle_button,
       };
       for (HWND control : controls) {
         SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(ui_font), TRUE);
@@ -1688,19 +1989,19 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_p
       SetMenu(hwnd, make_main_menu());
 
       const alpha::Result init = state->api.init({
-          .app_data_dir = "got-soup-data-win",
-          .passphrase = "got-soup-dev-passphrase",
+          .app_data_dir = "soupnet-data-win",
+          .passphrase = "soupnet-dev-passphrase",
           .mode = alpha::AnonymityMode::Tor,
-          .seed_peers = {"seed.got-soup.local:4001"},
-          .seed_peers_mainnet = {"seed.got-soup.local:4001"},
+          .seed_peers = {"seed.got-soup.local:4001", "24.188.147.247:4001"},
+          .seed_peers_mainnet = {"seed.got-soup.local:4001", "24.188.147.247:4001"},
           .seed_peers_testnet = {"seed.got-soup.local:14001"},
           .alpha_test_mode = false,
           .peers_dat_path = {},
           .community_profile_path = "tomato-soup",
           .production_swap = true,
-          .block_interval_seconds = 25,
+          .block_interval_seconds = 150,
           .validation_interval_ticks = 10,
-          .block_reward_units = 50,
+          .block_reward_units = 115,
           .minimum_post_value = 0,
           .genesis_psz_timestamp = "",
           .mainnet_initial_allocations = {},
@@ -1734,6 +2035,8 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_p
       if (!init.ok) {
         MessageBoxW(hwnd, utf8_to_wide(init.message).c_str(), L"Init Error", MB_OK | MB_ICONERROR);
       }
+      state->ui_mode_file_path = state->api.node_status().data_dir + "/ui_mode.cfg";
+      state->developer_mode = read_developer_mode_flag(state->ui_mode_file_path);
 
       bootstrap_demo_data(state);
 
@@ -1743,17 +2046,29 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_p
       refresh_profile_and_about(state);
       refresh_node_status_view(state);
       refresh_rewards_view(state);
+      refresh_send_receive_views(state);
+      refresh_transactions_view(state);
+      refresh_hashspec_view(state);
       refresh_settings_view(state);
 
       RECT rect{};
       GetClientRect(hwnd, &rect);
       layout_controls(state, rect.right - rect.left, rect.bottom - rect.top);
+      SetTimer(hwnd, 1, 1500, nullptr);
       return 0;
     }
 
     case WM_SIZE:
       if (state != nullptr) {
         layout_controls(state, LOWORD(l_param), HIWORD(l_param));
+      }
+      return 0;
+
+    case WM_TIMER:
+      if (state != nullptr && w_param == 1) {
+        (void)state->api.sync_tick();
+        refresh_rewards_view(state);
+        refresh_hashspec_view(state);
       }
       return 0;
 
@@ -1764,6 +2079,13 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_p
           refresh_tab_visibility(state);
           if (TabCtrl_GetCurSel(state->tab_control) == static_cast<int>(TabIndex::Rewards)) {
             refresh_rewards_view(state);
+          } else if (TabCtrl_GetCurSel(state->tab_control) == static_cast<int>(TabIndex::Send) ||
+                     TabCtrl_GetCurSel(state->tab_control) == static_cast<int>(TabIndex::Receive)) {
+            refresh_send_receive_views(state);
+          } else if (TabCtrl_GetCurSel(state->tab_control) == static_cast<int>(TabIndex::Transactions)) {
+            refresh_transactions_view(state);
+          } else if (TabCtrl_GetCurSel(state->tab_control) == static_cast<int>(TabIndex::HashSpec)) {
+            refresh_hashspec_view(state);
           } else if (TabCtrl_GetCurSel(state->tab_control) == static_cast<int>(TabIndex::Settings)) {
             refresh_settings_view(state);
           }
@@ -1851,6 +2173,16 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_p
         return 0;
       }
 
+      if (command_id == kSendButtonId && command_code == BN_CLICKED && state != nullptr) {
+        send_rewards_to_address_from_ui(hwnd, state);
+        return 0;
+      }
+
+      if (command_id == kSignButtonId && command_code == BN_CLICKED && state != nullptr) {
+        sign_message_from_ui(hwnd, state);
+        return 0;
+      }
+
       if (command_id == kNodeApplyId && command_code == BN_CLICKED && state != nullptr) {
         apply_node_controls(hwnd, state);
         refresh_profile_and_about(state);
@@ -1932,6 +2264,18 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_p
         return 0;
       }
 
+      if (command_id == kSettingsDevModeToggleId && command_code == BN_CLICKED && state != nullptr) {
+        const bool target_mode = !state->developer_mode;
+        if (!write_developer_mode_flag(state->ui_mode_file_path, target_mode)) {
+          MessageBoxW(hwnd, L"Failed to persist UI mode file.", L"UI Mode", MB_OK | MB_ICONERROR);
+          return 0;
+        }
+        std::wstring msg = target_mode ? L"Developer Mode enabled. Reboot app to apply."
+                                       : L"User Friendly Mode enabled. Reboot app to apply.";
+        MessageBoxW(hwnd, msg.c_str(), L"UI Mode", MB_OK | MB_ICONINFORMATION);
+        return 0;
+      }
+
       if (command_id == kCloseButtonId && command_code == BN_CLICKED) {
         PostMessageW(hwnd, WM_CLOSE, 0, 0);
         return 0;
@@ -1944,7 +2288,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_p
 
       if (command_id == kMenuAboutId && state != nullptr) {
         const std::string about = build_about_text(state);
-        MessageBoxW(hwnd, utf8_to_wide(about).c_str(), L"About got-soup",
+        MessageBoxW(hwnd, utf8_to_wide(about).c_str(), L"About SoupNet",
                     MB_OK | MB_ICONINFORMATION);
         return 0;
       }
@@ -1953,6 +2297,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_p
     }
 
     case WM_DESTROY:
+      KillTimer(hwnd, 1);
       PostQuitMessage(0);
       return 0;
 
@@ -1975,10 +2320,10 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_p
 int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int show_command) {
   {
     std::string splash;
-    splash += "Got Soup::P2P Tomato Soup\r\n";
+    splash += "SoupNet::P2P Tomato Soup\r\n";
     splash += "Version: " + std::string{alpha::kAppVersion} + " (" + std::string{alpha::kBuildRelease} + ")\r\n";
     splash += "Network: mainnet (startup default)\r\n";
-    splash += "Splash PNG: got-soup-data-win/assets/tomato_soup.png\r\n";
+    splash += "Splash PNG: soupnet-data-win/assets/tomato_soup.png\r\n";
     MessageBoxW(nullptr, utf8_to_wide(splash).c_str(), L"Loading", MB_OK | MB_ICONINFORMATION);
   }
 

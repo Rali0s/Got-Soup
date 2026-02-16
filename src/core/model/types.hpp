@@ -101,6 +101,44 @@ struct RewardTransferDraft {
   std::string memo;
 };
 
+struct RewardTransferAddressDraft {
+  std::string to_address;
+  std::int64_t amount = 0;
+  std::string memo;
+};
+
+struct RewardTransactionSummary {
+  std::string transfer_id;
+  std::string event_id;
+  std::string from_cid;
+  std::string to_cid;
+  std::string from_address;
+  std::string to_address;
+  std::int64_t amount = 0;
+  std::int64_t fee = 0;
+  std::string memo;
+  std::int64_t unix_ts = 0;
+  std::uint64_t confirmation_count = 0;
+  std::int64_t confirmation_age_seconds = 0;
+};
+
+struct ReceiveAddressInfo {
+  std::string cid;
+  std::string display_name;
+  std::string address;
+  std::string public_key;
+  std::string private_key;
+};
+
+struct MessageSignatureSummary {
+  std::string message;
+  std::string signature;
+  std::string public_key;
+  std::string cid;
+  std::string address;
+  bool wallet_locked = false;
+};
+
 struct SearchQuery {
   std::string text;
   std::string category;
@@ -191,14 +229,6 @@ struct DbHealthReport {
   std::size_t confirmed_block_count = 0;
   std::size_t backfilled_block_count = 0;
   std::uint64_t block_interval_seconds = 0;
-  int pow_current_difficulty_nibbles = 0;
-  int pow_min_difficulty_nibbles = 0;
-  int pow_max_difficulty_nibbles = 0;
-  std::uint64_t pow_target_solve_seconds = 0;
-  std::uint64_t pow_retarget_window_claims = 0;
-  std::uint64_t pow_retarget_count = 0;
-  std::int64_t pow_last_window_avg_solve_seconds = 0;
-  std::int64_t pow_last_retarget_unix = 0;
   std::int64_t last_block_unix = 0;
   std::string genesis_psz_timestamp;
   std::string latest_merkle_root;
@@ -256,7 +286,7 @@ struct CommunityProfile {
   std::string peers_dat_path;
   std::string store_path;
   std::int64_t minimum_post_value = 0;
-  std::int64_t block_reward_units = 50;
+  std::int64_t block_reward_units = 115;
   std::string genesis_psz_timestamp;
   bool moderation_enabled = true;
   bool moderation_require_finality = true;
@@ -343,23 +373,24 @@ struct InitConfig {
   std::string peers_dat_path;
   std::string community_profile_path;
   bool production_swap = true;
-  std::uint64_t block_interval_seconds = 25;
+  std::uint64_t block_interval_seconds = 150;
   std::uint64_t validation_interval_ticks = 10;
-  std::int64_t block_reward_units = 50;
+  std::int64_t block_reward_units = 115;
   std::int64_t minimum_post_value = 0;
   std::string genesis_psz_timestamp;
   std::string mainnet_chain_id = "got-soup-mainnet-v1";
   std::string testnet_chain_id = "got-soup-testnet-v1";
   std::string mainnet_genesis_psz_timestamp =
-      "Got Soup::P2P Tomato Soup mainnet genesis | 2026-02-14";
+      "Feb. 16 2026 - 07:18 - 1771244337 - 'Europe's earnings gain pace while lofty valuations cap rewards' - "
+      "https://www.reuters.com/business/finance/europes-earnings-gain-pace-while-lofty-valuations-cap-rewards-2026-02-16/";
   std::string testnet_genesis_psz_timestamp =
       "Got Soup::P2P Tomato Soup testnet genesis | 2026-02-14";
   std::string mainnet_genesis_merkle_root =
-      "31fa9d91e27f722cada145e858f90dcec257d92d2f9105cb4df7a88f3bf0b5f4";
+      "a2471d6dbbdf47d3286d519c877eb41c9e95c1e260dc40940fbfc2d1bc037fb3";
   std::string testnet_genesis_merkle_root =
       "15857bf7a332e27ac17388b05300a0b3b493f0fda96e1dae3e2b9fec3fb8b6bd";
   std::string mainnet_genesis_block_hash =
-      "e96890f8c3254ed8926ab119747931cd4f595ccdde71badc857bb2ba7e78b50d";
+      "f4139d244257b46edef309b2dee362ed250980de99e3a43a0679f44cc7b2d978";
   std::string testnet_genesis_block_hash =
       "ead35284e7ce7d379a08e0555e70a6e238a652e6fbdbae6a6b3fbfaf5eb4cd30";
   std::vector<InitialAllocation> mainnet_initial_allocations;
@@ -367,12 +398,6 @@ struct InitConfig {
 
   ChainPolicy chain_policy{};
   ValidationLimits validation_limits{};
-  std::uint64_t pow_target_solve_seconds = 0;  // 0 -> follows block_interval_seconds
-  std::uint64_t pow_retarget_window_claims = 120;
-  int pow_min_difficulty_nibbles = 1;
-  int pow_max_difficulty_nibbles = 12;
-  int pow_mainnet_initial_difficulty_nibbles = 4;
-  int pow_testnet_initial_difficulty_nibbles = 3;
   ModerationPolicy default_moderation_policy{};
   std::vector<std::string> default_moderators;
   std::uint32_t blockdata_format_version = 2;

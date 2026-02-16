@@ -20,6 +20,7 @@ public:
   Result add_review(const ReviewDraft& draft);
   Result add_thumb_up(std::string_view recipe_id);
   Result transfer_rewards(const RewardTransferDraft& draft);
+  Result transfer_rewards_to_address(const RewardTransferAddressDraft& draft);
 
   Result set_transport_enabled(AnonymityMode mode, bool enabled);
   Result set_active_transport(AnonymityMode mode);
@@ -59,6 +60,15 @@ public:
   NodeStatusReport node_status() const;
   std::int64_t local_reward_balance() const;
   std::vector<RewardBalanceSummary> reward_balances() const;
+  std::vector<RewardTransactionSummary> reward_transactions() const;
+  ReceiveAddressInfo receive_info() const;
+  std::string hashspec_console() const;
+  std::string soup_address() const;
+  std::string public_key() const;
+  std::string private_key() const;
+  MessageSignatureSummary sign_message(std::string_view message) const;
+  bool verify_message_signature(std::string_view message, std::string_view signature,
+                                std::string_view public_key) const;
   ModerationStatus moderation_status() const;
 
   std::vector<CommunityProfile> community_profiles() const;

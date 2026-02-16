@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <charconv>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -417,7 +418,7 @@ Result Store::open(std::string_view app_data_dir, std::string_view vault_key) {
 }
 
 void Store::set_block_timing(std::uint64_t block_interval_seconds) {
-  block_interval_seconds_ = block_interval_seconds == 0 ? 25 : block_interval_seconds;
+  block_interval_seconds_ = block_interval_seconds == 0 ? 150 : block_interval_seconds;
 }
 
 void Store::set_genesis_psz_timestamp(std::string_view psz_timestamp) {
@@ -425,11 +426,11 @@ void Store::set_genesis_psz_timestamp(std::string_view psz_timestamp) {
 }
 
 void Store::set_block_reward_units(std::int64_t units) {
-  (void)units;
-  block_reward_units_ = 50;
-  max_token_supply_units_ = 71000000;
-  weekly_decay_numerator_ = 95;
-  weekly_decay_denominator_ = 100;
+  block_reward_units_ = units <= 0 ? 115 : units;
+  max_token_supply_units_ = 69359946;
+  per_block_subsidy_decay_fraction_ = 0.0000016435998841934918L;
+  min_subsidy_units_ = 1;
+  difficulty_adjustment_interval_blocks_ = 864;
 }
 
 void Store::set_chain_identity(std::string_view chain_id, std::string_view network_id) {
@@ -1918,7 +1919,7 @@ void Store::ensure_genesis_block(std::int64_t now_unix) {
 
   if (genesis_psz_timestamp_.empty()) {
     genesis_psz_timestamp_ =
-        "Got Soup::P2P Tomato Soup " + network_id_ + " genesis | " + std::to_string(now_unix);
+        "SoupNet::P2P Tomato Soup " + network_id_ + " genesis | " + std::to_string(now_unix);
   }
 
   BlockRecord genesis;
@@ -1935,7 +1936,7 @@ void Store::ensure_genesis_block(std::int64_t now_unix) {
 
 void Store::ensure_block_slots_until(std::int64_t now_unix) {
   if (block_interval_seconds_ == 0) {
-    block_interval_seconds_ = 25;
+    block_interval_seconds_ = 150;
   }
   ensure_genesis_block(now_unix);
 
@@ -2034,7 +2035,7 @@ void Store::recompute_block_hashes() {
     if (block.index == 0 && block.psz_timestamp.empty()) {
       if (genesis_psz_timestamp_.empty()) {
         genesis_psz_timestamp_ =
-            "Got Soup::P2P Tomato Soup " + network_id_ + " genesis | " + std::to_string(block.opened_unix);
+            "SoupNet::P2P Tomato Soup " + network_id_ + " genesis | " + std::to_string(block.opened_unix);
       }
       block.psz_timestamp = genesis_psz_timestamp_;
     }
@@ -2075,33 +2076,17 @@ void Store::recompute_block_hashes() {
   }
 }
 
-std::uint64_t Store::blocks_per_week() const {
-  const std::uint64_t interval = block_interval_seconds_ == 0 ? 25 : block_interval_seconds_;
-  const std::uint64_t blocks = (7ULL * 24ULL * 60ULL * 60ULL) / interval;
-  return blocks == 0 ? 1 : blocks;
-}
-
 std::int64_t Store::scheduled_reward_for_block(std::uint64_t block_index) const {
   if (block_index == 0) {
     return 0;
   }
-
-  const std::uint64_t week = (block_index - 1U) / blocks_per_week();
-  constexpr std::int64_t kScale = 1000000;
-  std::int64_t scaled = block_reward_units_ * kScale;
-  for (std::uint64_t i = 0; i < week; ++i) {
-    scaled = (scaled * weekly_decay_numerator_) / weekly_decay_denominator_;
-    if (scaled <= 0) {
-      break;
-    }
-  }
-
-  if (scaled <= 0) {
-    return 0;
-  }
-
-  const std::int64_t reward = scaled / kScale;
-  return reward > 0 ? reward : 0;
+  const long double decay = std::clamp(per_block_subsidy_decay_fraction_, 0.0L, 0.9999999999L);
+  const long double multiplier = 1.0L - decay;
+  const long double exponent = static_cast<long double>(block_index - 1U);
+  const long double raw = static_cast<long double>(block_reward_units_) * std::pow(multiplier, exponent);
+  const std::int64_t floor_units = std::max<std::int64_t>(1, min_subsidy_units_);
+  const std::int64_t reward = static_cast<std::int64_t>(raw);
+  return std::max<std::int64_t>(floor_units, reward);
 }
 
 std::int64_t Store::expected_claim_reward_for_block(std::uint64_t block_index,

@@ -79,8 +79,8 @@ void test_store_materialization() {
   const auto health = store.health_report();
   assert(health.healthy);
   assert(health.event_count == 1);
-  assert(store.next_claim_reward(1) == 50);
-  assert(store.next_claim_reward(24193) == 47);  // 50 * 0.95 floored
+  assert(store.next_claim_reward(1) == 115);
+  assert(store.next_claim_reward(24193) == 110);  // per-block exponential decay
 }
 
 void test_core_api_flow() {
@@ -544,7 +544,7 @@ void test_genesis_merkle_and_transfer_flow() {
   (void)api.sync_tick();
 
   const auto status = api.node_status();
-  assert(status.db.genesis_psz_timestamp == "The Times 14/Feb/2026 got-soup genesis");
+  assert(status.db.genesis_psz_timestamp.starts_with("Feb. 16 2026 - 07:18 - 1771244337"));
   assert(!status.db.latest_merkle_root.empty());
   assert(status.db.reward_claim_event_count >= 1);
   assert(status.local_reward_balance >= 4);

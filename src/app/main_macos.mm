@@ -1,13 +1,16 @@
 #import <Cocoa/Cocoa.h>
 
 #include <algorithm>
+#include <charconv>
 #include <cstdlib>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <vector>
 
 #include "core/api/core_api.hpp"
 #include "core/model/app_meta.hpp"
+#include "core/util/hash.hpp"
 
 namespace {
 
@@ -21,22 +24,40 @@ std::string from_ns_string(NSString* text) {
   return utf8 != nullptr ? std::string{utf8} : std::string{};
 }
 
+std::string soup_address_from_cid(std::string_view cid) {
+  if (cid.empty()) {
+    return std::string{alpha::kAddressPrefix};
+  }
+  return std::string{alpha::kAddressPrefix} + alpha::util::sha256_like_hex(cid).substr(0, 39);
+}
+
+std::string basil_leaf_summary(std::int64_t basil_units) {
+  const std::int64_t leafs = basil_units * alpha::kLeafsPerBasil;
+  return std::to_string(basil_units) + " " + std::string{alpha::kCurrencyMajorName} + " " +
+         std::string{alpha::kCurrencyMajorSymbol} + " (" + std::to_string(leafs) + " " +
+         std::string{alpha::kCurrencyMinorName} + " " + std::string{alpha::kCurrencyMinorSymbol} + ")";
+}
+
+std::string compact_basil_amount(std::int64_t basil_units) {
+  return std::to_string(basil_units) + " " + std::string{alpha::kCurrencyMajorSymbol};
+}
+
 std::string default_app_data_dir() {
   NSArray<NSURL*>* urls =
       [[NSFileManager defaultManager] URLsForDirectory:NSApplicationSupportDirectory inDomains:NSUserDomainMask];
   if (urls != nil && [urls count] > 0) {
     NSURL* app_support = [urls objectAtIndex:0];
-    NSURL* got_soup_dir = [app_support URLByAppendingPathComponent:@"got-soup" isDirectory:YES];
-    if (got_soup_dir != nil) {
-      return from_ns_string([got_soup_dir path]);
+    NSURL* soupnet_dir = [app_support URLByAppendingPathComponent:@"soupnet" isDirectory:YES];
+    if (soupnet_dir != nil) {
+      return from_ns_string([soupnet_dir path]);
     }
   }
 
   const char* home = std::getenv("HOME");
   if (home != nullptr && home[0] != '\0') {
-    return std::string{home} + "/Library/Application Support/got-soup";
+    return std::string{home} + "/Library/Application Support/soupnet";
   }
-  return "got-soup-data-macos";
+  return "soupnet-data-macos";
 }
 
 void show_error_alert(NSWindow* window, const std::string& title, const std::string& message) {
@@ -45,6 +66,29 @@ void show_error_alert(NSWindow* window, const std::string& title, const std::str
   [alert setInformativeText:to_ns_string(message)];
   [alert addButtonWithTitle:@"OK"];
   [alert beginSheetModalForWindow:window completionHandler:nil];
+}
+
+bool read_developer_mode_flag(const std::string& file_path) {
+  std::ifstream in(file_path);
+  if (!in.is_open()) {
+    return false;
+  }
+  std::string line;
+  while (std::getline(in, line)) {
+    if (line == "developer=1") {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool write_developer_mode_flag(const std::string& file_path, bool enabled) {
+  std::ofstream out(file_path, std::ios::trunc);
+  if (!out.is_open()) {
+    return false;
+  }
+  out << "developer=" << (enabled ? "1" : "0") << "\n";
+  return static_cast<bool>(out);
 }
 
 }  // namespace
@@ -93,7 +137,20 @@ void show_error_alert(NSWindow* window, const std::string& title, const std::str
   NSButton* _profile_import_button;
   NSButton* _profile_nuke_button;
   NSTextView* _profile_text;
-  NSTextView* _rewards_text;
+  NSTextField* _wallet_available_value;
+  NSTextField* _wallet_pending_value;
+  NSTextField* _wallet_total_value;
+  NSTextView* _wallet_recent_text;
+  NSTextField* _send_address_field;
+  NSTextField* _send_amount_field;
+  NSTextField* _send_memo_field;
+  NSButton* _send_button;
+  NSTextField* _sign_message_field;
+  NSButton* _sign_button;
+  NSTextView* _signature_text;
+  NSTextView* _receive_text;
+  NSTextView* _transactions_text;
+  NSTextView* _hashspec_text;
   NSTextView* _about_text;
   NSTextView* _settings_text;
   NSButton* _settings_lock_wallet_button;
@@ -104,7 +161,9 @@ void show_error_alert(NSWindow* window, const std::string& title, const std::str
   NSSecureTextField* _settings_recover_local_password_field;
   NSButton* _settings_recover_wallet_button;
   NSButton* _settings_validate_button;
+  NSButton* _settings_dev_mode_button;
   NSImageView* _about_image_view;
+  NSTextField* _about_leaf_glyph;
 
   NSButton* _node_tor_toggle;
   NSButton* _node_i2p_toggle;
@@ -122,6 +181,9 @@ void show_error_alert(NSWindow* window, const std::string& title, const std::str
   std::unique_ptr<alpha::CoreApi> _api;
   std::vector<std::string> _opening_keys;
   std::vector<alpha::RecipeSummary> _recipes;
+  bool _developer_mode;
+  std::string _ui_mode_file_path;
+  NSTimer* _live_timer;
 }
 
 - (void)buildMenu {
@@ -131,7 +193,7 @@ void show_error_alert(NSWindow* window, const std::string& title, const std::str
   NSMenuItem* app_root = [[NSMenuItem alloc] init];
   [menu_bar addItem:app_root];
 
-  NSMenu* app_menu = [[NSMenu alloc] initWithTitle:@"got-soup"];
+  NSMenu* app_menu = [[NSMenu alloc] initWithTitle:@"SoupNet"];
   NSMenuItem* about_item = [[NSMenuItem alloc] initWithTitle:@"About / Credits"
                                                       action:@selector(showAboutCredits:)
                                                keyEquivalent:@""];
@@ -139,7 +201,7 @@ void show_error_alert(NSWindow* window, const std::string& title, const std::str
   [app_menu addItem:about_item];
   [app_menu addItem:[NSMenuItem separatorItem]];
 
-  NSMenuItem* quit_item = [[NSMenuItem alloc] initWithTitle:@"Quit got-soup"
+  NSMenuItem* quit_item = [[NSMenuItem alloc] initWithTitle:@"Quit SoupNet"
                                                      action:@selector(terminate:)
                                               keyEquivalent:@"q"];
   [app_menu addItem:quit_item];
@@ -180,8 +242,10 @@ void show_error_alert(NSWindow* window, const std::string& title, const std::str
   [_profile_duplicate_policy_toggle setState:profile.reject_duplicate_names ? NSControlStateValueOn
                                                                            : NSControlStateValueOff];
 
+  const std::string soup_address = soup_address_from_cid(profile.cid.value);
   std::string profile_text;
   profile_text += "CID: " + profile.cid.value + "\n";
+  profile_text += std::string{alpha::kNetworkDisplayName} + " Address: " + soup_address + "\n";
   profile_text += "Display Name: " + profile.display_name + "\n";
   profile_text += "Display Name State: ";
   profile_text += (profile.display_name_immortalized ? "IMMORTALIZED" : "not set");
@@ -195,6 +259,7 @@ void show_error_alert(NSWindow* window, const std::string& title, const std::str
   profile_text += "Bio:\n" + profile.bio_markdown + "\n\n";
   profile_text += "Community: " + node.community.community_id + "\n";
   profile_text += "Profile file: " + node.community.profile_path + "\n";
+  profile_text += "Balance: " + basil_leaf_summary(node.local_reward_balance) + "\n";
   profile_text += "Active Transport: ";
   profile_text += (node.active_mode == alpha::AnonymityMode::I2P ? "I2P" : "Tor");
   profile_text += "\n";
@@ -207,13 +272,22 @@ void show_error_alert(NSWindow* window, const std::string& title, const std::str
   about += "Current P2P:Soup Version Build Release: " + std::string{alpha::kAppVersion} + " (" +
            std::string{alpha::kBuildRelease} + ")\n";
   about += "Authors: " + std::string{alpha::kAuthorList} + "\n\n";
+  about += "Currency\n";
+  about += "- " + std::string{alpha::kCurrencyMajorName} + " (1.0 " +
+           std::string{alpha::kCurrencyMajorSymbol} + ")\n";
+  about += "- " + std::string{alpha::kCurrencyMinorName} + " (0.0000000001 " +
+           std::string{alpha::kCurrencyMinorSymbol} + ")\n";
+  about += "- Address Prefix: " + std::string{alpha::kAddressPrefix} + "\n\n";
   about += "Credits\n";
   about += "- Core: C++23 alpha_core module\n";
   about += "- UI: Native Cocoa shell\n";
   about += "- Planned deps: libp2p, libsodium, SQLCipher, libtor, i2pd\n\n";
+  about += "Reference\n";
+  about += "- https://github.com/hendrayoga/smallchange\n\n";
   about += "Assets\n";
   about += "- About PNG (transparent): " + node.data_dir + "/assets/about.png\n";
   about += "- Splash PNG: " + node.data_dir + "/assets/tomato_soup.png\n\n";
+  about += "- Leaf Icon (currency): " + node.data_dir + "/assets/leaf_icon.png\n\n";
   about += "Chain\n";
   about += "- Chain ID: " + node.genesis.chain_id + "\n";
   about += "- Network: " + node.genesis.network_id + "\n";
@@ -230,6 +304,8 @@ void show_error_alert(NSWindow* window, const std::string& title, const std::str
   } else {
     [_about_image_view setHidden:YES];
   }
+  [_about_leaf_glyph setStringValue:@"❧"];
+  [_about_leaf_glyph setTextColor:[NSColor systemGreenColor]];
 }
 
 - (void)refreshForumTab {
@@ -377,13 +453,13 @@ void show_error_alert(NSWindow* window, const std::string& title, const std::str
   text += " Reserved=" + std::to_string(node.db.reserved_block_count);
   text += " Confirmed=" + std::to_string(node.db.confirmed_block_count);
   text += " Backfilled=" + std::to_string(node.db.backfilled_block_count) + "\n";
-  text += "Rewards: supply=" + std::to_string(node.db.reward_supply);
-  text += " local=" + std::to_string(node.local_reward_balance);
+  text += "Rewards: supply=" + basil_leaf_summary(node.db.reward_supply);
+  text += " local=" + basil_leaf_summary(node.local_reward_balance);
   text += " claims=" + std::to_string(node.db.reward_claim_event_count);
   text += " transfers=" + std::to_string(node.db.reward_transfer_event_count) + "\n";
-  text += "Issued=" + std::to_string(node.db.issued_reward_total);
-  text += " Burned=" + std::to_string(node.db.burned_fee_total);
-  text += " Cap=" + std::to_string(node.db.max_token_supply) + "\n";
+  text += "Issued=" + basil_leaf_summary(node.db.issued_reward_total);
+  text += " Burned=" + basil_leaf_summary(node.db.burned_fee_total);
+  text += " Cap=" + basil_leaf_summary(node.db.max_token_supply) + "\n";
   text += "Invalid economic events: " + std::to_string(node.db.invalid_economic_event_count) + "\n";
   text += "Dropped invalid events: " + std::to_string(node.db.invalid_event_drop_count) + "\n";
   text += "Block interval sec: " + std::to_string(node.db.block_interval_seconds) + "\n";
@@ -438,41 +514,81 @@ void show_error_alert(NSWindow* window, const std::string& title, const std::str
 
   [_node_status_text setString:to_ns_string(text)];
   [self refreshRewardsTab];
+  [self refreshSendReceiveTransactionsTabs];
+  [self refreshHashSpecTab];
   [self refreshSettingsTab];
 }
 
 - (void)refreshRewardsTab {
   const auto node = _api->node_status();
+  const std::int64_t available = node.local_reward_balance;
+  const std::int64_t pending = 0;
+  const std::int64_t total = available + pending;
 
-  std::string text;
-  text += "Rewards (PoW)\n\n";
-  text += "Network: " + node.p2p.network + "\n";
-  text += "Block Interval (sec): " + std::to_string(node.db.block_interval_seconds) + "\n";
-  text += "Genesis pszTimestamp: " + node.db.genesis_psz_timestamp + "\n";
-  text += "Latest Merkle Root: " + node.db.latest_merkle_root + "\n\n";
+  [_wallet_available_value setStringValue:to_ns_string(compact_basil_amount(available))];
+  [_wallet_pending_value setStringValue:to_ns_string(compact_basil_amount(pending))];
+  [_wallet_total_value setStringValue:to_ns_string(compact_basil_amount(total))];
 
-  text += "Tokenomics\n";
-  text += "Max Supply: " + std::to_string(node.db.max_token_supply) + "\n";
-  text += "Issued: " + std::to_string(node.db.issued_reward_total) + "\n";
-  text += "Burned Fees: " + std::to_string(node.db.burned_fee_total) + "\n";
-  text += "Circulating: " + std::to_string(node.db.reward_supply) + "\n";
-  text += "Local Balance: " + std::to_string(node.local_reward_balance) + "\n\n";
-
-  text += "PoW Claims\n";
-  text += "Reward Claim Events: " + std::to_string(node.db.reward_claim_event_count) + "\n";
-  text += "Transfer Events: " + std::to_string(node.db.reward_transfer_event_count) + "\n";
-  text += "Invalid Economic Events: " + std::to_string(node.db.invalid_economic_event_count) + "\n";
-  text += "Finality Threshold: " + std::to_string(node.db.confirmation_threshold) + "\n";
-  text += "Mining occurs automatically in sync ticks for confirmed unclaimed blocks.\n\n";
-
-  text += "Balances\n";
-  for (const auto& balance : node.reward_balances) {
-    std::string label =
-        balance.display_name.empty() ? balance.cid : (balance.display_name + " (" + balance.cid + ")");
-    text += "- " + label + ": " + std::to_string(balance.balance) + "\n";
+  const auto transactions = _api->reward_transactions();
+  std::string tx_text;
+  if (transactions.empty()) {
+    tx_text += "No recent transactions.\n";
+  } else {
+    const std::size_t limit = std::min<std::size_t>(transactions.size(), 12U);
+    for (std::size_t i = 0; i < limit; ++i) {
+      const auto& tx = transactions[i];
+      const bool outgoing = tx.amount < 0;
+      tx_text += outgoing ? "- " : "+ ";
+      tx_text += compact_basil_amount(outgoing ? -tx.amount : tx.amount);
+      tx_text += "  unix:";
+      tx_text += std::to_string(tx.unix_ts);
+      tx_text += "\n";
+      tx_text += tx.to_address.empty() ? tx.from_address : tx.to_address;
+      tx_text += "\n";
+      tx_text += "conf:";
+      tx_text += std::to_string(tx.confirmation_count);
+      tx_text += " fee:";
+      tx_text += compact_basil_amount(tx.fee);
+      tx_text += "\n\n";
+    }
   }
+  [_wallet_recent_text setString:to_ns_string(tx_text)];
+}
 
-  [_rewards_text setString:to_ns_string(text)];
+- (void)refreshSendReceiveTransactionsTabs {
+  const auto receive = _api->receive_info();
+  std::string receive_text;
+  receive_text += "Receive\n\n";
+  receive_text += "Display Name: " + receive.display_name + "\n";
+  receive_text += "CID: " + receive.cid + "\n";
+  receive_text += "Address: " + receive.address + "\n\n";
+  receive_text += "PubKey:\n" + receive.public_key + "\n\n";
+  receive_text += "PrivKey:\n" + receive.private_key + "\n";
+  [_receive_text setString:to_ns_string(receive_text)];
+
+  const auto transactions = _api->reward_transactions();
+  std::string tx_text;
+  tx_text += "Transactions History\n\n";
+  if (transactions.empty()) {
+    tx_text += "No transfer events found.\n";
+  } else {
+    for (const auto& tx : transactions) {
+      tx_text += "- TxID: " + tx.transfer_id + "\n";
+      tx_text += "  Event: " + tx.event_id + "\n";
+      tx_text += "  From: " + tx.from_address + "\n";
+      tx_text += "  To: " + tx.to_address + "\n";
+      tx_text += "  Amount: " + basil_leaf_summary(tx.amount) + "\n";
+      tx_text += "  Fee Burn: " + basil_leaf_summary(tx.fee) + "\n";
+      tx_text += "  Memo: " + tx.memo + "\n";
+      tx_text += "  Unix: " + std::to_string(tx.unix_ts) + "\n";
+      tx_text += "  Confirmations: " + std::to_string(tx.confirmation_count) + "\n\n";
+    }
+  }
+  [_transactions_text setString:to_ns_string(tx_text)];
+}
+
+- (void)refreshHashSpecTab {
+  [_hashspec_text setString:to_ns_string(_api->hashspec_console())];
 }
 
 - (void)refreshSettingsTab {
@@ -510,6 +626,9 @@ void show_error_alert(NSWindow* window, const std::string& title, const std::str
   text += "Max event bytes: " + std::to_string(node.validation_limits.max_event_bytes) + "\n";
   text += "Future drift seconds: " + std::to_string(node.validation_limits.max_future_drift_seconds) + "\n";
   text += "Past drift seconds: " + std::to_string(node.validation_limits.max_past_drift_seconds) + "\n\n";
+  text += "UI Mode: ";
+  text += (_developer_mode ? "Developer" : "User Friendly");
+  text += " (restart required after change)\n\n";
 
   text += "Genesis\n";
   text += "Chain ID: " + node.genesis.chain_id + "\n";
@@ -522,7 +641,79 @@ void show_error_alert(NSWindow* window, const std::string& title, const std::str
     text += "- " + seed + "\n";
   }
 
+  [_settings_dev_mode_button setTitle:to_ns_string(_developer_mode ? "Disable Developer Mode (Reboot)"
+                                                                   : "Enable Developer Mode (Reboot)")];
   [_settings_text setString:to_ns_string(text)];
+}
+
+- (void)applyUiModeVisibility {
+  const BOOL dev = _developer_mode ? YES : NO;
+  [_search_field setHidden:!dev];
+  [_parent_menu setHidden:!dev];
+  [_secondary_menu setHidden:!dev];
+  [[_lookup_table enclosingScrollView] setHidden:!dev];
+
+  [_recipes_thumb_button setHidden:!dev];
+  [_recipes_rate_menu setHidden:!dev];
+  [_recipes_rate_button setHidden:!dev];
+
+  [_upload_title setHidden:!dev];
+  [_upload_category setHidden:!dev];
+  [[_upload_body enclosingScrollView] setHidden:!dev];
+  [_upload_button setHidden:!dev];
+
+  [_profile_name_field setHidden:!dev];
+  [_profile_set_name_button setHidden:!dev];
+  [_profile_duplicate_policy_toggle setHidden:!dev];
+  [_profile_apply_policy_button setHidden:!dev];
+  [_profile_cipher_password_field setHidden:!dev];
+  [_profile_cipher_salt_field setHidden:!dev];
+  [_profile_cipher_apply_button setHidden:!dev];
+  [_profile_update_key_button setHidden:!dev];
+  [_profile_export_path_field setHidden:!dev];
+  [_profile_export_password_field setHidden:!dev];
+  [_profile_export_salt_field setHidden:!dev];
+  [_profile_export_button setHidden:!dev];
+  [_profile_import_path_field setHidden:!dev];
+  [_profile_import_password_field setHidden:!dev];
+  [_profile_import_button setHidden:!dev];
+  [_profile_nuke_button setHidden:!dev];
+
+  [_send_address_field setHidden:!dev];
+  [_send_amount_field setHidden:!dev];
+  [_send_memo_field setHidden:!dev];
+  [_send_button setHidden:!dev];
+  [_sign_message_field setHidden:!dev];
+  [_sign_button setHidden:!dev];
+  [[_signature_text enclosingScrollView] setHidden:!dev];
+
+  [_node_tor_toggle setHidden:!dev];
+  [_node_i2p_toggle setHidden:!dev];
+  [_node_localhost_toggle setHidden:!dev];
+  [_node_mode_menu setHidden:!dev];
+  [_node_apply_button setHidden:!dev];
+  [_node_refresh_button setHidden:!dev];
+  [_node_peer_field setHidden:!dev];
+  [_node_add_peer_button setHidden:!dev];
+  [_node_community_id_field setHidden:!dev];
+  [_node_community_name_field setHidden:!dev];
+  [_node_community_apply_button setHidden:!dev];
+
+  [_settings_lock_wallet_button setHidden:!dev];
+  [_settings_unlock_password_field setHidden:!dev];
+  [_settings_unlock_wallet_button setHidden:!dev];
+  [_settings_recover_path_field setHidden:!dev];
+  [_settings_recover_backup_password_field setHidden:!dev];
+  [_settings_recover_local_password_field setHidden:!dev];
+  [_settings_recover_wallet_button setHidden:!dev];
+  [_settings_validate_button setHidden:!dev];
+}
+
+- (void)onLiveTick:(NSTimer*)timer {
+  (void)timer;
+  (void)_api->sync_tick();
+  [self refreshRewardsTab];
+  [self refreshHashSpecTab];
 }
 
 - (void)rebuildSecondaryMenu {
@@ -575,7 +766,7 @@ void show_error_alert(NSWindow* window, const std::string& title, const std::str
   [content addSubview:_tab_view];
 
   NSTabViewItem* recipes_item = [[NSTabViewItem alloc] initWithIdentifier:@"recipes"];
-  [recipes_item setLabel:@"Recipes"];
+  [recipes_item setLabel:@"Home"];
   NSView* recipes_view = [[NSView alloc] initWithFrame:[_tab_view bounds]];
   [recipes_view setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
   _recipes_text = [self makeReadOnlyTextViewInFrame:NSMakeRect(0.0, 34.0, frame.size.width, frame.size.height - 34.0)
@@ -842,15 +1033,155 @@ void show_error_alert(NSWindow* window, const std::string& title, const std::str
   [_tab_view addTabViewItem:profile_item];
 
   NSTabViewItem* rewards_item = [[NSTabViewItem alloc] initWithIdentifier:@"rewards"];
-  [rewards_item setLabel:@"Rewards"];
+  [rewards_item setLabel:@"Wallet"];
   NSView* rewards_view = [[NSView alloc] initWithFrame:[_tab_view bounds]];
   [rewards_view setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
-  _rewards_text = [self makeReadOnlyTextViewInFrame:[rewards_view bounds] parent:rewards_view];
+
+  const CGFloat panel_gap = 12.0;
+  const CGFloat panel_w = std::max<CGFloat>(220.0, (frame.size.width - panel_gap) * 0.5);
+
+  NSBox* balances_box =
+      [[NSBox alloc] initWithFrame:NSMakeRect(0.0, frame.size.height - 260.0, panel_w, 250.0)];
+  [balances_box setTitle:@"Balances"];
+  [balances_box setBoxType:NSBoxPrimary];
+  [balances_box setAutoresizingMask:NSViewWidthSizable | NSViewMinYMargin];
+  NSView* balances_content = [balances_box contentView];
+
+  NSTextField* available_label = [[NSTextField alloc] initWithFrame:NSMakeRect(12.0, 160.0, 120.0, 24.0)];
+  [available_label setEditable:NO];
+  [available_label setBezeled:NO];
+  [available_label setDrawsBackground:NO];
+  [available_label setSelectable:NO];
+  [available_label setStringValue:@"Available:"];
+  [balances_content addSubview:available_label];
+  _wallet_available_value = [[NSTextField alloc] initWithFrame:NSMakeRect(132.0, 160.0, panel_w - 148.0, 24.0)];
+  [_wallet_available_value setEditable:NO];
+  [_wallet_available_value setBezeled:NO];
+  [_wallet_available_value setDrawsBackground:NO];
+  [_wallet_available_value setSelectable:NO];
+  [_wallet_available_value setAlignment:NSTextAlignmentRight];
+  [balances_content addSubview:_wallet_available_value];
+
+  NSTextField* pending_label = [[NSTextField alloc] initWithFrame:NSMakeRect(12.0, 126.0, 120.0, 24.0)];
+  [pending_label setEditable:NO];
+  [pending_label setBezeled:NO];
+  [pending_label setDrawsBackground:NO];
+  [pending_label setSelectable:NO];
+  [pending_label setStringValue:@"Pending:"];
+  [balances_content addSubview:pending_label];
+  _wallet_pending_value = [[NSTextField alloc] initWithFrame:NSMakeRect(132.0, 126.0, panel_w - 148.0, 24.0)];
+  [_wallet_pending_value setEditable:NO];
+  [_wallet_pending_value setBezeled:NO];
+  [_wallet_pending_value setDrawsBackground:NO];
+  [_wallet_pending_value setSelectable:NO];
+  [_wallet_pending_value setAlignment:NSTextAlignmentRight];
+  [balances_content addSubview:_wallet_pending_value];
+
+  NSTextField* total_label = [[NSTextField alloc] initWithFrame:NSMakeRect(12.0, 60.0, 120.0, 24.0)];
+  [total_label setEditable:NO];
+  [total_label setBezeled:NO];
+  [total_label setDrawsBackground:NO];
+  [total_label setSelectable:NO];
+  [total_label setStringValue:@"Total:"];
+  [balances_content addSubview:total_label];
+  _wallet_total_value = [[NSTextField alloc] initWithFrame:NSMakeRect(132.0, 60.0, panel_w - 148.0, 24.0)];
+  [_wallet_total_value setEditable:NO];
+  [_wallet_total_value setBezeled:NO];
+  [_wallet_total_value setDrawsBackground:NO];
+  [_wallet_total_value setSelectable:NO];
+  [_wallet_total_value setAlignment:NSTextAlignmentRight];
+  [balances_content addSubview:_wallet_total_value];
+  [rewards_view addSubview:balances_box];
+
+  NSBox* recent_box =
+      [[NSBox alloc] initWithFrame:NSMakeRect(panel_w + panel_gap, 0.0, frame.size.width - panel_w - panel_gap, frame.size.height)];
+  [recent_box setTitle:@"Recent transactions"];
+  [recent_box setBoxType:NSBoxPrimary];
+  [recent_box setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
+  _wallet_recent_text = [self makeReadOnlyTextViewInFrame:[[recent_box contentView] bounds] parent:[recent_box contentView]];
+  [_wallet_recent_text setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
+  [rewards_view addSubview:recent_box];
+
   [rewards_item setView:rewards_view];
   [_tab_view addTabViewItem:rewards_item];
 
+  NSTabViewItem* send_item = [[NSTabViewItem alloc] initWithIdentifier:@"send"];
+  [send_item setLabel:@"Send"];
+  NSView* send_view = [[NSView alloc] initWithFrame:[_tab_view bounds]];
+  [send_view setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
+
+  _send_address_field =
+      [[NSTextField alloc] initWithFrame:NSMakeRect(0.0, frame.size.height - 28.0, frame.size.width - 132.0, 24.0)];
+  [_send_address_field setPlaceholderString:@"SoupNet Address (starts with S)"];
+  [_send_address_field setAutoresizingMask:NSViewWidthSizable | NSViewMinYMargin];
+  [send_view addSubview:_send_address_field];
+
+  _send_amount_field = [[NSTextField alloc] initWithFrame:NSMakeRect(0.0, frame.size.height - 56.0, 180.0, 24.0)];
+  [_send_amount_field setPlaceholderString:@"Amount (Basil units)"];
+  [_send_amount_field setAutoresizingMask:NSViewMaxXMargin | NSViewMinYMargin];
+  [send_view addSubview:_send_amount_field];
+
+  _send_button = [[NSButton alloc] initWithFrame:NSMakeRect(188.0, frame.size.height - 56.0, 140.0, 24.0)];
+  [_send_button setTitle:@"Send Basil/Leafs"];
+  [_send_button setButtonType:NSButtonTypeMomentaryPushIn];
+  [_send_button setBezelStyle:NSBezelStyleRounded];
+  [_send_button setTarget:self];
+  [_send_button setAction:@selector(onSendToAddress:)];
+  [_send_button setAutoresizingMask:NSViewMaxXMargin | NSViewMinYMargin];
+  [send_view addSubview:_send_button];
+
+  _send_memo_field =
+      [[NSTextField alloc] initWithFrame:NSMakeRect(0.0, frame.size.height - 84.0, frame.size.width, 24.0)];
+  [_send_memo_field setPlaceholderString:@"Memo (optional)"];
+  [_send_memo_field setAutoresizingMask:NSViewWidthSizable | NSViewMinYMargin];
+  [send_view addSubview:_send_memo_field];
+
+  _sign_message_field =
+      [[NSTextField alloc] initWithFrame:NSMakeRect(0.0, frame.size.height - 112.0, frame.size.width - 132.0, 24.0)];
+  [_sign_message_field setPlaceholderString:@"Message to sign"];
+  [_sign_message_field setAutoresizingMask:NSViewWidthSizable | NSViewMinYMargin];
+  [send_view addSubview:_sign_message_field];
+
+  _sign_button = [[NSButton alloc] initWithFrame:NSMakeRect(frame.size.width - 124.0, frame.size.height - 112.0, 124.0, 24.0)];
+  [_sign_button setTitle:@"Sign Message"];
+  [_sign_button setButtonType:NSButtonTypeMomentaryPushIn];
+  [_sign_button setBezelStyle:NSBezelStyleRounded];
+  [_sign_button setTarget:self];
+  [_sign_button setAction:@selector(onSignMessage:)];
+  [_sign_button setAutoresizingMask:NSViewMinXMargin | NSViewMinYMargin];
+  [send_view addSubview:_sign_button];
+
+  _signature_text = [self makeReadOnlyTextViewInFrame:NSMakeRect(0.0, 0.0, frame.size.width, frame.size.height - 118.0)
+                                                parent:send_view];
+  [send_item setView:send_view];
+  [_tab_view addTabViewItem:send_item];
+
+  NSTabViewItem* receive_item = [[NSTabViewItem alloc] initWithIdentifier:@"receive"];
+  [receive_item setLabel:@"Receive"];
+  NSView* receive_view = [[NSView alloc] initWithFrame:[_tab_view bounds]];
+  [receive_view setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
+  _receive_text = [self makeReadOnlyTextViewInFrame:[receive_view bounds] parent:receive_view];
+  [receive_item setView:receive_view];
+  [_tab_view addTabViewItem:receive_item];
+
+  NSTabViewItem* transactions_item = [[NSTabViewItem alloc] initWithIdentifier:@"transactions"];
+  [transactions_item setLabel:@"Transactions"];
+  NSView* transactions_view = [[NSView alloc] initWithFrame:[_tab_view bounds]];
+  [transactions_view setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
+  _transactions_text = [self makeReadOnlyTextViewInFrame:[transactions_view bounds] parent:transactions_view];
+  [transactions_item setView:transactions_view];
+  [_tab_view addTabViewItem:transactions_item];
+
+  NSTabViewItem* hashspec_item = [[NSTabViewItem alloc] initWithIdentifier:@"hashspec"];
+  [hashspec_item setLabel:@"HashSpec"];
+  NSView* hashspec_view = [[NSView alloc] initWithFrame:[_tab_view bounds]];
+  [hashspec_view setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
+  _hashspec_text = [self makeReadOnlyTextViewInFrame:[hashspec_view bounds] parent:hashspec_view];
+  [hashspec_item setView:hashspec_view];
+  [_tab_view addTabViewItem:hashspec_item];
+
   NSTabViewItem* node_item = [[NSTabViewItem alloc] initWithIdentifier:@"node"];
-  [node_item setLabel:@"Node Status"];
+  [node_item setLabel:@"Status"];
   NSView* node_view = [[NSView alloc] initWithFrame:[_tab_view bounds]];
   [node_view setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
 
@@ -974,6 +1305,15 @@ void show_error_alert(NSWindow* window, const std::string& title, const std::str
   [_settings_validate_button setAutoresizingMask:NSViewMaxXMargin | NSViewMinYMargin];
   [settings_view addSubview:_settings_validate_button];
 
+  _settings_dev_mode_button = [[NSButton alloc] initWithFrame:NSMakeRect(554.0, frame.size.height - 28.0, 240.0, 24.0)];
+  [_settings_dev_mode_button setTitle:@"Enable Developer Mode (Reboot)"];
+  [_settings_dev_mode_button setButtonType:NSButtonTypeMomentaryPushIn];
+  [_settings_dev_mode_button setBezelStyle:NSBezelStyleRounded];
+  [_settings_dev_mode_button setTarget:self];
+  [_settings_dev_mode_button setAction:@selector(onSettingsToggleDeveloperMode:)];
+  [_settings_dev_mode_button setAutoresizingMask:NSViewMaxXMargin | NSViewMinYMargin];
+  [settings_view addSubview:_settings_dev_mode_button];
+
   _settings_recover_path_field = [[NSTextField alloc] initWithFrame:NSMakeRect(0.0, frame.size.height - 56.0, frame.size.width - 420.0, 24.0)];
   [_settings_recover_path_field setStringValue:@"backup/identity-backup.dat"];
   [_settings_recover_path_field setAutoresizingMask:NSViewWidthSizable | NSViewMinYMargin];
@@ -1014,6 +1354,17 @@ void show_error_alert(NSWindow* window, const std::string& title, const std::str
   [_about_image_view setAlphaValue:0.92];
   [_about_image_view setAutoresizingMask:NSViewMaxXMargin | NSViewMinYMargin];
   [about_view addSubview:_about_image_view];
+  _about_leaf_glyph = [[NSTextField alloc] initWithFrame:NSMakeRect(172.0, frame.size.height - 52.0, 38.0, 38.0)];
+  [_about_leaf_glyph setEditable:NO];
+  [_about_leaf_glyph setBezeled:NO];
+  [_about_leaf_glyph setDrawsBackground:NO];
+  [_about_leaf_glyph setSelectable:NO];
+  [_about_leaf_glyph setAlignment:NSTextAlignmentCenter];
+  [_about_leaf_glyph setFont:[NSFont systemFontOfSize:30.0 weight:NSFontWeightBold]];
+  [_about_leaf_glyph setTextColor:[NSColor systemGreenColor]];
+  [_about_leaf_glyph setStringValue:@"❧"];
+  [_about_leaf_glyph setAutoresizingMask:NSViewMaxXMargin | NSViewMinYMargin];
+  [about_view addSubview:_about_leaf_glyph];
   _about_text = [self makeReadOnlyTextViewInFrame:NSMakeRect(216.0, 0.0, std::max<CGFloat>(120.0, frame.size.width - 216.0), frame.size.height)
                                            parent:about_view];
   [about_item setView:about_view];
@@ -1029,7 +1380,7 @@ void show_error_alert(NSWindow* window, const std::string& title, const std::str
                                            backing:NSBackingStoreBuffered
                                              defer:NO];
 
-  [_window setTitle:@"got-soup::P2P Tomato Soup - Recipe Forum"];
+  [_window setTitle:@"SoupNet::P2P Tomato Soup - Recipe Forum"];
   [_window center];
 
   NSView* content = [_window contentView];
@@ -1060,7 +1411,8 @@ void show_error_alert(NSWindow* window, const std::string& title, const std::str
   [_close_button setAutoresizingMask:NSViewMinXMargin | NSViewMinYMargin];
   [content addSubview:_close_button];
 
-  const CGFloat body_h = NSHeight(bounds) - (margin * 3.0) - top_h;
+  const CGFloat body_h = _developer_mode ? (NSHeight(bounds) - (margin * 3.0) - top_h)
+                                         : (NSHeight(bounds) - (margin * 2.0));
   const CGFloat body_top = margin + body_h;
 
   _parent_menu = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(margin, body_top - combo_h, left_w, combo_h)
@@ -1096,7 +1448,7 @@ void show_error_alert(NSWindow* window, const std::string& title, const std::str
   [opening_scroll setDocumentView:_lookup_table];
   [content addSubview:opening_scroll];
 
-  const CGFloat tab_x = (margin * 2.0) + left_w;
+  const CGFloat tab_x = _developer_mode ? ((margin * 2.0) + left_w) : margin;
   const CGFloat tab_w = NSWidth(bounds) - tab_x - margin;
   const CGFloat tab_h = body_h;
   [self buildTabsInFrame:NSMakeRect(tab_x, margin, tab_w, tab_h) parent:content];
@@ -1131,6 +1483,26 @@ void show_error_alert(NSWindow* window, const std::string& title, const std::str
   }
   [content addSubview:image_view];
 
+  NSImageView* leaf_icon_view = [[NSImageView alloc] initWithFrame:NSMakeRect(410.0, 284.0, 56.0, 56.0)];
+  [leaf_icon_view setImageScaling:NSImageScaleProportionallyUpOrDown];
+  NSString* leaf_path = to_ns_string(node.data_dir + "/assets/leaf_icon.png");
+  NSImage* leaf_image = [[NSImage alloc] initWithContentsOfFile:leaf_path];
+  if (leaf_image != nil) {
+    [leaf_icon_view setImage:leaf_image];
+    [content addSubview:leaf_icon_view];
+  } else {
+    NSTextField* leaf_glyph = [[NSTextField alloc] initWithFrame:NSMakeRect(426.0, 286.0, 32.0, 50.0)];
+    [leaf_glyph setEditable:NO];
+    [leaf_glyph setBezeled:NO];
+    [leaf_glyph setDrawsBackground:NO];
+    [leaf_glyph setSelectable:NO];
+    [leaf_glyph setAlignment:NSTextAlignmentCenter];
+    [leaf_glyph setFont:[NSFont systemFontOfSize:38.0 weight:NSFontWeightBold]];
+    [leaf_glyph setTextColor:[NSColor systemGreenColor]];
+    [leaf_glyph setStringValue:@"❧"];
+    [content addSubview:leaf_glyph];
+  }
+
   NSTextField* title = [[NSTextField alloc] initWithFrame:NSMakeRect(20.0, 72.0, 480.0, 30.0)];
   [title setEditable:NO];
   [title setBezeled:NO];
@@ -1138,7 +1510,7 @@ void show_error_alert(NSWindow* window, const std::string& title, const std::str
   [title setSelectable:NO];
   [title setAlignment:NSTextAlignmentCenter];
   [title setFont:[NSFont boldSystemFontOfSize:20.0]];
-  [title setStringValue:@"Got Soup::P2P Tomato Soup"];
+  [title setStringValue:@"SoupNet::P2P Tomato Soup"];
   [content addSubview:title];
 
   NSTextField* meta = [[NSTextField alloc] initWithFrame:NSMakeRect(20.0, 42.0, 480.0, 24.0)];
@@ -1189,22 +1561,24 @@ void show_error_alert(NSWindow* window, const std::string& title, const std::str
 - (void)applicationDidFinishLaunching:(NSNotification*)notification {
   (void)notification;
 
+  _developer_mode = false;
+  _live_timer = nil;
   _api = std::make_unique<alpha::CoreApi>();
   const std::string app_data_dir = default_app_data_dir();
   const alpha::Result init = _api->init({
       .app_data_dir = app_data_dir,
-      .passphrase = "got-soup-dev-passphrase",
+      .passphrase = "soupnet-dev-passphrase",
       .mode = alpha::AnonymityMode::Tor,
-      .seed_peers = {"seed.got-soup.local:4001"},
-      .seed_peers_mainnet = {"seed.got-soup.local:4001"},
+      .seed_peers = {"seed.got-soup.local:4001", "24.188.147.247:4001"},
+      .seed_peers_mainnet = {"seed.got-soup.local:4001", "24.188.147.247:4001"},
       .seed_peers_testnet = {"seed.got-soup.local:14001"},
       .alpha_test_mode = false,
       .peers_dat_path = {},
       .community_profile_path = "tomato-soup",
       .production_swap = true,
-      .block_interval_seconds = 25,
+      .block_interval_seconds = 150,
       .validation_interval_ticks = 10,
-      .block_reward_units = 50,
+      .block_reward_units = 115,
       .minimum_post_value = 0,
       .genesis_psz_timestamp = "",
       .chain_policy = {
@@ -1233,6 +1607,8 @@ void show_error_alert(NSWindow* window, const std::string& title, const std::str
       .p2p_mainnet_port = 4001,
       .p2p_testnet_port = 14001,
   });
+  _ui_mode_file_path = app_data_dir + "/ui_mode.cfg";
+  _developer_mode = read_developer_mode_flag(_ui_mode_file_path);
 
   [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
   [self buildMenu];
@@ -1258,9 +1634,23 @@ void show_error_alert(NSWindow* window, const std::string& title, const std::str
   [self refreshRecipesTab];
   [self refreshProfileAndAbout];
   [self refreshNodeStatusTab];
+  [self applyUiModeVisibility];
+  _live_timer = [NSTimer scheduledTimerWithTimeInterval:1.5
+                                                  target:self
+                                                selector:@selector(onLiveTick:)
+                                                userInfo:nil
+                                                 repeats:YES];
 
   [_window makeKeyAndOrderFront:nil];
   [NSApp activateIgnoringOtherApps:YES];
+}
+
+- (void)applicationWillTerminate:(NSNotification*)notification {
+  (void)notification;
+  if (_live_timer != nil) {
+    [_live_timer invalidate];
+    _live_timer = nil;
+  }
 }
 
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication*)sender {
@@ -1471,6 +1861,63 @@ void show_error_alert(NSWindow* window, const std::string& title, const std::str
   [self refreshForumTab];
   [self refreshNodeStatusTab];
   [self rebuildOpeningList];
+}
+
+- (void)onSendToAddress:(id)sender {
+  (void)sender;
+
+  const std::string address = from_ns_string([_send_address_field stringValue]);
+  const std::string amount_text = from_ns_string([_send_amount_field stringValue]);
+  const std::string memo = from_ns_string([_send_memo_field stringValue]);
+  if (address.empty() || amount_text.empty()) {
+    show_error_alert(_window, "Send", "Address and amount are required.");
+    return;
+  }
+
+  std::int64_t amount = 0;
+  const auto parsed = std::from_chars(amount_text.data(), amount_text.data() + amount_text.size(), amount);
+  if (parsed.ec != std::errc() || amount <= 0) {
+    show_error_alert(_window, "Send", "Amount must be a positive integer.");
+    return;
+  }
+
+  const alpha::Result result = _api->transfer_rewards_to_address({
+      .to_address = address,
+      .amount = amount,
+      .memo = memo,
+  });
+  if (!result.ok) {
+    show_error_alert(_window, "Send", result.message);
+    return;
+  }
+
+  [_send_amount_field setStringValue:@""];
+  [_send_memo_field setStringValue:@""];
+  [self refreshNodeStatusTab];
+  [self refreshProfileAndAbout];
+  [self refreshSendReceiveTransactionsTabs];
+}
+
+- (void)onSignMessage:(id)sender {
+  (void)sender;
+
+  const std::string message = from_ns_string([_sign_message_field stringValue]);
+  if (message.empty()) {
+    show_error_alert(_window, "Sign Message", "Message is required.");
+    return;
+  }
+
+  const auto signed_message = _api->sign_message(message);
+  std::string text;
+  text += "Message:\n" + signed_message.message + "\n\n";
+  text += "Signature:\n" + signed_message.signature + "\n\n";
+  text += "Address: " + signed_message.address + "\n";
+  text += "CID: " + signed_message.cid + "\n";
+  text += "PubKey:\n" + signed_message.public_key + "\n";
+  text += "Wallet Locked: ";
+  text += signed_message.wallet_locked ? "YES" : "NO";
+  text += "\n";
+  [_signature_text setString:to_ns_string(text)];
 }
 
 - (void)onNodeApply:(id)sender {
@@ -1727,6 +2174,22 @@ void show_error_alert(NSWindow* window, const std::string& title, const std::str
   [self refreshNodeStatusTab];
 }
 
+- (void)onSettingsToggleDeveloperMode:(id)sender {
+  (void)sender;
+  const bool target_mode = !_developer_mode;
+  if (!write_developer_mode_flag(_ui_mode_file_path, target_mode)) {
+    show_error_alert(_window, "UI Mode", "Failed to persist UI mode file.");
+    return;
+  }
+  std::string msg = target_mode ? "Developer Mode enabled. Reboot app to apply."
+                                : "User Friendly Mode enabled. Reboot app to apply.";
+  NSAlert* alert = [[NSAlert alloc] init];
+  [alert setMessageText:@"UI Mode"];
+  [alert setInformativeText:to_ns_string(msg)];
+  [alert addButtonWithTitle:@"OK"];
+  [alert beginSheetModalForWindow:_window completionHandler:nil];
+}
+
 - (void)onClose:(id)sender {
   (void)sender;
   [NSApp terminate:nil];
@@ -1745,12 +2208,13 @@ void show_error_alert(NSWindow* window, const std::string& title, const std::str
   about += "Authors: " + std::string{alpha::kAuthorList} + "\n\n";
   about += "Chain: " + node.genesis.chain_id + " (" + node.genesis.network_id + ")\n";
   about += "Genesis Merkle: " + node.genesis.merkle_root + "\n";
+  about += "Reference: https://github.com/hendrayoga/smallchange\n";
   about += "About PNG: " + node.data_dir + "/assets/about.png\n";
   about += "Splash PNG: " + node.data_dir + "/assets/tomato_soup.png\n\n";
   about += "Core Phase 1:\n" + node.core_phase_status + "\n";
 
   NSAlert* alert = [[NSAlert alloc] init];
-  [alert setMessageText:@"About got-soup"];
+  [alert setMessageText:@"About SoupNet"];
   [alert setInformativeText:to_ns_string(about)];
   [alert addButtonWithTitle:@"OK"];
   [alert runModal];

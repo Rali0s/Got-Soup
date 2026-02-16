@@ -56,10 +56,12 @@ public:
   Result add_review(const ReviewDraft& draft);
   Result add_thumb_up(std::string_view recipe_id);
   Result transfer_rewards(const RewardTransferDraft& draft);
+  Result transfer_rewards_to_address(const RewardTransferAddressDraft& draft);
 
   std::vector<RecipeSummary> search(const SearchQuery& query) const;
   std::vector<ThreadSummary> threads(std::string_view recipe_id) const;
   std::vector<ReplySummary> replies(std::string_view thread_id) const;
+  std::vector<RewardTransactionSummary> reward_transactions() const;
 
   std::vector<EventEnvelope> sync_tick();
   Result ingest_remote_event(const EventEnvelope& event);
@@ -99,6 +101,14 @@ public:
   [[nodiscard]] NodeStatusReport node_status() const;
   [[nodiscard]] std::int64_t local_reward_balance() const;
   [[nodiscard]] std::vector<RewardBalanceSummary> reward_balances() const;
+  [[nodiscard]] ReceiveAddressInfo receive_info() const;
+  [[nodiscard]] std::string hashspec_console() const;
+  [[nodiscard]] std::string soup_address() const;
+  [[nodiscard]] std::string public_key() const;
+  [[nodiscard]] std::string private_key() const;
+  [[nodiscard]] MessageSignatureSummary sign_message(std::string_view message) const;
+  [[nodiscard]] bool verify_message_signature(std::string_view message, std::string_view signature,
+                                              std::string_view public_key) const;
   [[nodiscard]] ModerationStatus moderation_status() const;
 
   [[nodiscard]] std::vector<CommunityProfile> community_profiles() const;
@@ -118,6 +128,7 @@ private:
   Result try_claim_confirmed_block_rewards();
   Result validate_and_apply_post_cost(std::int64_t requested_units, std::int64_t& out_applied_units) const;
   std::optional<std::string> resolve_display_name_to_cid(std::string_view display_name) const;
+  std::optional<std::string> resolve_address_to_cid(std::string_view address) const;
 
   Result restart_network();
   Result ensure_provider_state(AnonymityMode mode, bool enabled);

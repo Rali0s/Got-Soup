@@ -57,8 +57,8 @@ def main() -> None:
     mainnet = GenesisSpec(
         chain_id="got-soup-mainnet-v1",
         network_id="mainnet",
-        psz_timestamp="Got Soup::P2P Tomato Soup mainnet genesis | 2026-02-14",
-        seed_peers=["seed.got-soup.local:4001"],
+        psz_timestamp="Feb. 16 2026 - 07:18 - 1771244337 - 'Europe's earnings gain pace while lofty valuations cap rewards' - https://www.reuters.com/business/finance/europes-earnings-gain-pace-while-lofty-valuations-cap-rewards-2026-02-16/",
+        seed_peers=["seed.got-soup.local:4001","24.188.147.247:4001"],
         initial_allocations=[],
     )
     testnet = GenesisSpec(

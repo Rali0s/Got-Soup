@@ -97,11 +97,12 @@ private:
   std::unordered_map<std::string, bool> moderation_core_topic_overrides_;
   std::int64_t issued_reward_total_ = 0;
   std::int64_t burned_fee_total_ = 0;
-  std::uint64_t block_interval_seconds_ = 25;
-  std::int64_t block_reward_units_ = 50;
-  std::int64_t max_token_supply_units_ = 71000000;
-  std::int64_t weekly_decay_numerator_ = 95;
-  std::int64_t weekly_decay_denominator_ = 100;
+  std::uint64_t block_interval_seconds_ = 150;
+  std::int64_t block_reward_units_ = 115;
+  std::int64_t max_token_supply_units_ = 69359946;
+  long double per_block_subsidy_decay_fraction_ = 0.0000016435998841934918L;
+  std::int64_t min_subsidy_units_ = 1;
+  std::uint64_t difficulty_adjustment_interval_blocks_ = 864;
   int pow_difficulty_nibbles_ = 4;
   std::string chain_id_ = "got-soup-mainnet-v1";
   std::string network_id_ = "mainnet";
@@ -137,7 +138,6 @@ private:
   void assign_unassigned_events_to_blocks();
   void rebuild_event_to_block_index();
   void recompute_block_hashes();
-  [[nodiscard]] std::uint64_t blocks_per_week() const;
   [[nodiscard]] std::int64_t scheduled_reward_for_block(std::uint64_t block_index) const;
   [[nodiscard]] std::int64_t expected_claim_reward_for_block(std::uint64_t block_index,
                                                              std::int64_t issued_so_far) const;

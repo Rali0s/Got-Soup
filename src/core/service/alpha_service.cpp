@@ -15,6 +15,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "core/model/app_meta.hpp"
 #include "core/util/canonical.hpp"
 #include "core/util/hash.hpp"
 
@@ -35,6 +36,13 @@ bool is_absolute_path(std::string_view value) {
 
 std::string mode_to_string(AnonymityMode mode) {
   return mode == AnonymityMode::I2P ? "I2P" : "Tor";
+}
+
+std::string soup_address_from_cid(std::string_view cid) {
+  if (cid.empty()) {
+    return std::string{alpha::kAddressPrefix} + "000000000000000000000000000000000000000";
+  }
+  return std::string{alpha::kAddressPrefix} + util::sha256_like_hex(cid).substr(0, 39);
 }
 
 std::string recipe_segment_label(const RecipeSummary& recipe) {
@@ -94,6 +102,35 @@ std::string join_csv(std::vector<std::string> values) {
   return out.str();
 }
 
+std::string preview_merkle_root(std::vector<std::string> leaves) {
+  if (leaves.empty()) {
+    return util::sha256_like_hex("merkle-empty");
+  }
+  while (leaves.size() > 1U) {
+    if ((leaves.size() % 2U) != 0U) {
+      leaves.push_back(leaves.back());
+    }
+    std::vector<std::string> next;
+    next.reserve(leaves.size() / 2U);
+    for (std::size_t i = 0; i < leaves.size(); i += 2U) {
+      next.push_back(util::sha256_like_hex(leaves[i] + "|" + leaves[i + 1U]));
+    }
+    leaves = std::move(next);
+  }
+  return leaves.front();
+}
+
+std::string join_parts(const std::vector<std::string>& values) {
+  std::ostringstream out;
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    if (i > 0) {
+      out << ',';
+    }
+    out << values[i];
+  }
+  return out.str();
+}
+
 ModerationPolicy moderation_policy_from_profile(const CommunityProfile& profile) {
   ModerationPolicy policy;
   policy.moderation_enabled = profile.moderation_enabled;
@@ -115,6 +152,49 @@ bool is_png_file(const std::filesystem::path& path) {
     return static_cast<char>(std::tolower(c));
   });
   return ext == ".png";
+}
+
+bool should_rebuild_local_store(std::string_view message) {
+  return message.find("Chain ID mismatch") != std::string_view::npos ||
+         message.find("Network ID mismatch") != std::string_view::npos ||
+         message.find("Community mismatch") != std::string_view::npos ||
+         message.find("Failed to parse") != std::string_view::npos ||
+         message.find("Event ID mismatch") != std::string_view::npos;
+}
+
+Result quarantine_and_reset_store_dir(std::string_view app_data_dir, std::string_view store_dir,
+                                      std::string_view reason) {
+  std::error_code ec;
+  const std::filesystem::path target{std::string{store_dir}};
+  const std::filesystem::path app_root{std::string{app_data_dir}};
+  const std::filesystem::path recovery_root = app_root / "recovery";
+  std::filesystem::create_directories(recovery_root, ec);
+  if (ec) {
+    return Result::failure("Unable to create recovery directory: " + ec.message());
+  }
+
+  if (std::filesystem::exists(target, ec) && !ec) {
+    const std::string folder_name =
+        target.filename().empty() ? "store" : target.filename().string();
+    const std::filesystem::path quarantine =
+        recovery_root / (folder_name + "-quarantine-" + std::to_string(util::unix_timestamp_now()));
+    std::filesystem::rename(target, quarantine, ec);
+    if (ec) {
+      ec.clear();
+      std::filesystem::remove_all(target, ec);
+      if (ec) {
+        return Result::failure("Unable to reset corrupted store path: " + ec.message());
+      }
+    }
+  }
+
+  ec.clear();
+  std::filesystem::create_directories(target, ec);
+  if (ec) {
+    return Result::failure("Unable to recreate store directory: " + ec.message());
+  }
+
+  return Result::success("Local store reset: " + std::string{reason});
 }
 
 std::optional<std::filesystem::path> find_named_asset_upwards(std::string_view filename, std::size_t max_levels) {
@@ -143,8 +223,40 @@ std::optional<std::filesystem::path> find_named_asset_upwards(std::string_view f
   return std::nullopt;
 }
 
+std::optional<std::filesystem::path> find_named_asset_in_subdir_upwards(std::string_view subdir,
+                                                                         std::string_view filename,
+                                                                         std::size_t max_levels) {
+  std::error_code ec;
+  std::filesystem::path dir = std::filesystem::current_path(ec);
+  if (ec) {
+    return std::nullopt;
+  }
+
+  for (std::size_t level = 0; level <= max_levels; ++level) {
+    const std::filesystem::path candidate = dir / std::string{subdir} / std::string{filename};
+    if (std::filesystem::exists(candidate, ec) && std::filesystem::is_regular_file(candidate, ec)) {
+      return candidate;
+    }
+
+    if (!dir.has_parent_path()) {
+      break;
+    }
+    const std::filesystem::path parent = dir.parent_path();
+    if (parent == dir) {
+      break;
+    }
+    dir = parent;
+  }
+
+  return std::nullopt;
+}
+
 std::optional<std::filesystem::path> find_about_asset_upwards(std::size_t max_levels) {
   if (const auto exact = find_named_asset_upwards("about.png", max_levels); exact.has_value()) {
+    return exact;
+  }
+  if (const auto exact = find_named_asset_in_subdir_upwards("Art", "about.png", max_levels);
+      exact.has_value()) {
     return exact;
   }
 
@@ -190,6 +302,56 @@ std::optional<std::filesystem::path> find_about_asset_upwards(std::size_t max_le
   return std::nullopt;
 }
 
+std::optional<std::filesystem::path> find_leaf_asset_upwards(std::size_t max_levels) {
+  if (const auto exact = find_named_asset_upwards("leaf_icon.png", max_levels); exact.has_value()) {
+    return exact;
+  }
+  if (const auto exact = find_named_asset_in_subdir_upwards("Art", "leaf_icon.png", max_levels);
+      exact.has_value()) {
+    return exact;
+  }
+  if (const auto exact = find_named_asset_upwards("leaf.png", max_levels); exact.has_value()) {
+    return exact;
+  }
+  if (const auto exact = find_named_asset_in_subdir_upwards("Art", "leaf.png", max_levels);
+      exact.has_value()) {
+    return exact;
+  }
+
+  std::error_code ec;
+  std::filesystem::path dir = std::filesystem::current_path(ec);
+  if (ec) {
+    return std::nullopt;
+  }
+
+  for (std::size_t level = 0; level <= max_levels; ++level) {
+    for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+      if (ec) {
+        break;
+      }
+      if (!entry.is_regular_file(ec) || ec || !is_png_file(entry.path())) {
+        continue;
+      }
+      std::string filename = entry.path().filename().string();
+      std::ranges::transform(filename, filename.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+      });
+      if (filename.find("leaf") != std::string::npos) {
+        return entry.path();
+      }
+    }
+    if (!dir.has_parent_path()) {
+      break;
+    }
+    const std::filesystem::path parent = dir.parent_path();
+    if (parent == dir) {
+      break;
+    }
+    dir = parent;
+  }
+  return std::nullopt;
+}
+
 void seed_default_assets(std::string_view app_data_dir) {
   std::error_code ec;
   const std::filesystem::path assets_dir = std::filesystem::path{std::string{app_data_dir}} / "assets";
@@ -200,7 +362,11 @@ void seed_default_assets(std::string_view app_data_dir) {
 
   const std::filesystem::path splash_dest = assets_dir / "tomato_soup.png";
   if (!std::filesystem::exists(splash_dest, ec)) {
-    if (const auto splash_src = find_named_asset_upwards("tomato_soup.png", 4); splash_src.has_value()) {
+    std::optional<std::filesystem::path> splash_src = find_named_asset_upwards("tomato_soup.png", 4);
+    if (!splash_src.has_value()) {
+      splash_src = find_named_asset_in_subdir_upwards("Art", "tomato_soup.png", 4);
+    }
+    if (splash_src.has_value()) {
       std::filesystem::copy_file(*splash_src, splash_dest, std::filesystem::copy_options::skip_existing, ec);
     }
   }
@@ -233,6 +399,13 @@ void seed_default_assets(std::string_view app_data_dir) {
     }
     if (about_src.has_value()) {
       std::filesystem::copy_file(*about_src, about_dest, std::filesystem::copy_options::skip_existing, ec);
+    }
+  }
+
+  const std::filesystem::path leaf_dest = assets_dir / "leaf_icon.png";
+  if (!std::filesystem::exists(leaf_dest, ec)) {
+    if (const auto leaf_src = find_leaf_asset_upwards(4); leaf_src.has_value()) {
+      std::filesystem::copy_file(*leaf_src, leaf_dest, std::filesystem::copy_options::skip_existing, ec);
     }
   }
 }
@@ -294,7 +467,7 @@ Result AlphaService::init(const InitConfig& config) {
     config_.seed_peers_testnet = config_.seed_peers_mainnet;
   }
   if (config_.seed_peers_mainnet.empty()) {
-    config_.seed_peers_mainnet = {"seed.got-soup.local:4001"};
+    config_.seed_peers_mainnet = {"seed.got-soup.local:4001", "24.188.147.247:4001"};
   }
   if (config_.seed_peers_testnet.empty()) {
     config_.seed_peers_testnet = {"seed.got-soup.local:14001"};
@@ -314,8 +487,8 @@ Result AlphaService::init(const InitConfig& config) {
   wallet_last_unlocked_unix_ = crypto_.last_unlocked_unix();
   wallet_last_locked_unix_ = crypto_.last_locked_unix();
 
-  store_.set_block_timing(config_.block_interval_seconds == 0 ? 25 : config_.block_interval_seconds);
-  store_.set_block_reward_units(config_.block_reward_units <= 0 ? 50 : config_.block_reward_units);
+  store_.set_block_timing(config_.block_interval_seconds == 0 ? 150 : config_.block_interval_seconds);
+  store_.set_block_reward_units(config_.block_reward_units <= 0 ? 115 : config_.block_reward_units);
   store_.set_chain_policy(config_.chain_policy);
   store_.set_validation_limits(config_.validation_limits);
   store_.set_moderation_policy(config_.default_moderation_policy);
@@ -355,7 +528,7 @@ Result AlphaService::init(const InitConfig& config) {
   }
 
   initialized_ = true;
-  return Result::success("got-soup service initialized with node status controls, peers.dat and community profiles.");
+  return Result::success("SoupNet service initialized with node status controls, peers.dat and community profiles.");
 }
 
 Result AlphaService::create_recipe(const RecipeDraft& draft) {
@@ -590,6 +763,57 @@ Result AlphaService::transfer_rewards(const RewardTransferDraft& draft) {
   return append_locally_and_queue(event);
 }
 
+Result AlphaService::transfer_rewards_to_address(const RewardTransferAddressDraft& draft) {
+  if (const Result unlocked = ensure_wallet_unlocked("transfer_rewards_to_address"); !unlocked.ok) {
+    return unlocked;
+  }
+  const std::string target_address = util::trim_copy(draft.to_address);
+  if (target_address.empty()) {
+    return Result::failure("Reward transfer requires a target address.");
+  }
+  if (!target_address.starts_with(alpha::kAddressPrefix)) {
+    return Result::failure("Invalid address prefix for target address.");
+  }
+  if (draft.amount <= 0) {
+    return Result::failure("Reward transfer amount must be positive.");
+  }
+
+  const std::int64_t fee = store_.transfer_burn_fee(draft.amount);
+  const std::uint64_t nonce = store_.next_transfer_nonce(crypto_.identity().cid.value);
+  const std::int64_t local_balance = store_.reward_balance(crypto_.identity().cid.value);
+  if (local_balance < (draft.amount + fee)) {
+    return Result::failure("Insufficient reward balance for transfer.");
+  }
+
+  const auto target_cid = resolve_address_to_cid(target_address);
+  if (!target_cid.has_value()) {
+    return Result::failure("Target address is unknown in current community.");
+  }
+
+  const std::string transfer_id =
+      "xfr-" + crypto_.hash_bytes(current_community_.community_id + crypto_.identity().cid.value +
+                                  *target_cid + std::to_string(draft.amount) +
+                                  std::to_string(util::unix_timestamp_now()))
+                   .substr(0, 16);
+  const std::string witness_root =
+      util::sha256_like_hex(crypto_.identity().cid.value + "|" + *target_cid + "|" +
+                            std::to_string(draft.amount) + "|" + std::to_string(fee) + "|" +
+                            std::to_string(nonce));
+
+  EventEnvelope event = make_event(
+      EventKind::RewardTransferred,
+      {{"transfer_id", transfer_id},
+       {"to_cid", *target_cid},
+       {"to_address", target_address},
+       {"amount", std::to_string(draft.amount)},
+       {"fee", std::to_string(fee)},
+       {"nonce", std::to_string(nonce)},
+       {"witness_root", witness_root},
+       {"memo", draft.memo}});
+
+  return append_locally_and_queue(event);
+}
+
 std::vector<RecipeSummary> AlphaService::search(const SearchQuery& query) const {
   return store_.query_recipes(query);
 }
@@ -600,6 +824,54 @@ std::vector<ThreadSummary> AlphaService::threads(std::string_view recipe_id) con
 
 std::vector<ReplySummary> AlphaService::replies(std::string_view thread_id) const {
   return store_.query_replies(thread_id);
+}
+
+std::vector<RewardTransactionSummary> AlphaService::reward_transactions() const {
+  std::vector<RewardTransactionSummary> out;
+  out.reserve(store_.all_events().size());
+
+  for (const auto& event : store_.all_events()) {
+    if (event.kind != EventKind::RewardTransferred) {
+      continue;
+    }
+    const auto payload = util::parse_canonical_map(event.payload);
+    if (!payload.contains("to_cid") || !payload.contains("amount")) {
+      continue;
+    }
+
+    RewardTransactionSummary tx;
+    tx.transfer_id = payload.contains("transfer_id") ? payload.at("transfer_id") : "";
+    tx.event_id = event.event_id;
+    tx.from_cid = event.author_cid;
+    tx.to_cid = payload.at("to_cid");
+    tx.from_address = soup_address_from_cid(tx.from_cid);
+    tx.to_address = payload.contains("to_address") ? payload.at("to_address") : soup_address_from_cid(tx.to_cid);
+    tx.amount = parse_int64_default(payload.at("amount"), 0);
+    tx.fee = parse_int64_default(payload.contains("fee") ? payload.at("fee") : "0", 0);
+    tx.memo = payload.contains("memo") ? payload.at("memo") : "";
+    tx.unix_ts = event.unix_ts;
+    if (const auto metrics = store_.confirmation_for_object(event.event_id); metrics.has_value()) {
+      const auto parsed = util::parse_canonical_map(*metrics);
+      const auto cc_it = parsed.find("confirmation_count");
+      const auto age_it = parsed.find("confirmation_age_seconds");
+      if (cc_it != parsed.end()) {
+        tx.confirmation_count =
+            static_cast<std::uint64_t>(std::max<std::int64_t>(0, parse_int64_default(cc_it->second, 0)));
+      }
+      if (age_it != parsed.end()) {
+        tx.confirmation_age_seconds = parse_int64_default(age_it->second, 0);
+      }
+    }
+    out.push_back(std::move(tx));
+  }
+
+  std::ranges::sort(out, [](const RewardTransactionSummary& a, const RewardTransactionSummary& b) {
+    if (a.unix_ts == b.unix_ts) {
+      return a.event_id > b.event_id;
+    }
+    return a.unix_ts > b.unix_ts;
+  });
+  return out;
 }
 
 std::vector<EventEnvelope> AlphaService::sync_tick() {
@@ -1122,23 +1394,72 @@ Result AlphaService::use_community_profile(std::string_view community_or_path,
                            config_.prune_keep_recent_blocks);
 
   store_.set_block_reward_units(current_community_.block_reward_units <= 0
-                                    ? (config_.block_reward_units <= 0 ? 50 : config_.block_reward_units)
+                                    ? (config_.block_reward_units <= 0 ? 115 : config_.block_reward_units)
                                     : current_community_.block_reward_units);
-  if (!current_community_.genesis_psz_timestamp.empty()) {
-    store_.set_genesis_psz_timestamp(current_community_.genesis_psz_timestamp);
-  } else if (!genesis_psz.empty()) {
+  if (!genesis_psz.empty()) {
+    // Mainnet/Testnet release genesis is hardcoded and authoritative for this node.
     store_.set_genesis_psz_timestamp(genesis_psz);
+    if (current_community_.genesis_psz_timestamp != genesis_psz) {
+      current_community_.genesis_psz_timestamp = genesis_psz;
+      const Result persist_profile = write_community_profile_file(current_community_);
+      if (!persist_profile.ok) {
+        return persist_profile;
+      }
+    }
   } else if (!config_.genesis_psz_timestamp.empty()) {
     store_.set_genesis_psz_timestamp(config_.genesis_psz_timestamp);
+    if (current_community_.genesis_psz_timestamp != config_.genesis_psz_timestamp) {
+      current_community_.genesis_psz_timestamp = config_.genesis_psz_timestamp;
+      const Result persist_profile = write_community_profile_file(current_community_);
+      if (!persist_profile.ok) {
+        return persist_profile;
+      }
+    }
   }
 
   const std::string effective_store_path =
       resolve_data_path(current_community_.store_path + "-" + network_suffix, "db-" + current_community_.community_id);
   const std::string store_key =
       crypto_.derive_vault_key(config_.passphrase, "store:" + current_community_.community_id + ":" + network_suffix);
-  const Result store_result = store_.open(effective_store_path, store_key);
+  Result store_result = store_.open(effective_store_path, store_key);
+  if (!store_result.ok && should_rebuild_local_store(store_result.message)) {
+    const Result reset =
+        quarantine_and_reset_store_dir(config_.app_data_dir, effective_store_path, store_result.message);
+    if (!reset.ok) {
+      return reset;
+    }
+    store_result = store_.open(effective_store_path, store_key);
+  }
   if (!store_result.ok) {
     return store_result;
+  }
+  const auto& existing_blocks = store_.all_blocks();
+  if (!existing_blocks.empty()) {
+    const auto& genesis_block = existing_blocks.front();
+    bool genesis_mismatch = false;
+    if (!genesis_merkle.empty() && !genesis_block.merkle_root.empty() &&
+        genesis_block.merkle_root != genesis_merkle) {
+      genesis_mismatch = true;
+    }
+    if (!genesis_block_hash.empty() && !genesis_block.block_hash.empty() &&
+        genesis_block.block_hash != genesis_block_hash) {
+      genesis_mismatch = true;
+    }
+    if (!genesis_psz.empty() && !genesis_block.psz_timestamp.empty() &&
+        genesis_block.psz_timestamp != genesis_psz) {
+      genesis_mismatch = true;
+    }
+    if (genesis_mismatch) {
+      const Result reset = quarantine_and_reset_store_dir(config_.app_data_dir, effective_store_path,
+                                                          "Genesis release spec mismatch.");
+      if (!reset.ok) {
+        return reset;
+      }
+      const Result reopen = store_.open(effective_store_path, store_key);
+      if (!reopen.ok) {
+        return reopen;
+      }
+    }
   }
 
   const Result block_check = store_.routine_block_check(util::unix_timestamp_now());
@@ -1169,7 +1490,25 @@ Result AlphaService::use_community_profile(std::string_view community_or_path,
     return save_peers;
   }
 
-  return run_backtest_validation();
+  Result validation = run_backtest_validation();
+  if (!validation.ok && should_rebuild_local_store(validation.message)) {
+    const Result reset =
+        quarantine_and_reset_store_dir(config_.app_data_dir, effective_store_path, validation.message);
+    if (!reset.ok) {
+      return reset;
+    }
+    const Result reopen = store_.open(effective_store_path, store_key);
+    if (!reopen.ok) {
+      return reopen;
+    }
+    const Result rebuilt_block_check = store_.routine_block_check(util::unix_timestamp_now());
+    if (!rebuilt_block_check.ok) {
+      return rebuilt_block_check;
+    }
+    validation = run_backtest_validation();
+  }
+
+  return validation;
 }
 
 ProfileSummary AlphaService::profile() const {
@@ -1182,7 +1521,7 @@ ProfileSummary AlphaService::profile() const {
     display_name = own_it->second;
   }
   if (display_name.empty()) {
-    display_name = "got-soup User";
+    display_name = "SoupNet User";
   }
 
   std::size_t duplicate_count = 0;
@@ -1310,6 +1649,141 @@ std::vector<RewardBalanceSummary> AlphaService::reward_balances() const {
     }
   }
   return balances;
+}
+
+ReceiveAddressInfo AlphaService::receive_info() const {
+  ReceiveAddressInfo info;
+  info.cid = crypto_.identity().cid.value;
+  info.display_name = local_display_name_;
+  info.address = soup_address_from_cid(info.cid);
+  info.public_key = crypto_.identity().public_key;
+  info.private_key = crypto_.identity().private_key;
+  return info;
+}
+
+std::string AlphaService::hashspec_console() const {
+  const auto& blocks = store_.all_blocks();
+  const auto& events = store_.all_events();
+  std::ostringstream text;
+  text << "HashSpec Console\n\n";
+  if (blocks.empty()) {
+    text << "No blocks found.\n";
+    return text.str();
+  }
+
+  std::unordered_map<std::string, std::string> payload_hash_by_event;
+  payload_hash_by_event.reserve(events.size());
+  for (const auto& event : events) {
+    payload_hash_by_event[event.event_id] = util::sha256_like_hex(event.payload);
+  }
+
+  const auto& latest = blocks.back();
+  const std::uint64_t next_index = latest.index + 1U;
+  const std::int64_t next_open_unix = latest.opened_unix + static_cast<std::int64_t>(config_.block_interval_seconds);
+  const std::string prev_hash = latest.block_hash.empty() ? "genesis" : latest.block_hash;
+
+  std::vector<std::string> next_event_ids;
+  if (latest.reserved && latest.event_ids.empty()) {
+    next_event_ids = {};
+  } else {
+    next_event_ids = {};
+  }
+
+  std::vector<std::string> merkle_leaves;
+  std::vector<std::string> content_parts;
+  for (const auto& event_id : next_event_ids) {
+    const auto it = payload_hash_by_event.find(event_id);
+    const std::string payload_hash = it == payload_hash_by_event.end() ? "missing" : it->second;
+    merkle_leaves.push_back(util::sha256_like_hex(event_id + ":" + payload_hash));
+    content_parts.push_back(event_id + ":" + payload_hash);
+  }
+  const std::string anticipated_merkle = preview_merkle_root(merkle_leaves);
+  const std::string anticipated_content_hash = util::sha256_like_hex(join_parts(content_parts));
+
+  std::ostringstream block_input;
+  block_input << next_index << "|" << next_open_unix << "|" << 1 << "|" << 0 << "|" << 0 << "|"
+              << prev_hash << "|" << anticipated_merkle << "|" << anticipated_content_hash << "|";
+  const std::string anticipated_block_hash = util::sha256_like_hex(block_input.str());
+
+  const bool testnet = should_use_testnet(alpha_test_mode_, active_mode_);
+  const int difficulty_nibbles = testnet ? 3 : 4;
+  const std::string pow_material =
+      current_community_.community_id + "|" + crypto_.identity().cid.value + "|" + std::to_string(next_index) +
+      "|" + anticipated_block_hash + "|" + anticipated_merkle;
+
+  text << "Chain: " << (testnet ? config_.testnet_chain_id : config_.mainnet_chain_id) << "\n";
+  text << "Network: " << (testnet ? "testnet" : "mainnet") << "\n";
+  text << "Latest Block Index: " << latest.index << "\n";
+  text << "Latest Block Hash: " << latest.block_hash << "\n";
+  text << "Latest Merkle Root: " << latest.merkle_root << "\n\n";
+
+  text << "Next Block Anticipation\n";
+  text << "- Next Index: " << next_index << "\n";
+  text << "- Prev Hash: " << prev_hash << "\n";
+  text << "- Provisional Event Count: " << next_event_ids.size() << "\n";
+  text << "- Anticipated Merkle Root: " << anticipated_merkle << "\n";
+  text << "- Anticipated Content Hash: " << anticipated_content_hash << "\n";
+  text << "- Anticipated Block Hash: " << anticipated_block_hash << "\n\n";
+
+  text << "PoW Preview\n";
+  text << "- Difficulty (leading zero nibbles): " << difficulty_nibbles << "\n";
+  text << "- Material: " << pow_material << "\n";
+  text << "- Samples:\n";
+  for (std::uint64_t attempt = 0; attempt < 5U; ++attempt) {
+    const std::string sample = util::sha256_like_hex(pow_material + "|" + std::to_string(attempt));
+    text << "  nonce " << attempt << " => " << sample << "\n";
+  }
+
+  std::uint64_t found_nonce = 0;
+  std::string found_hash;
+  constexpr std::uint64_t kPreviewAttempts = 200000;
+  for (std::uint64_t attempt = 0; attempt < kPreviewAttempts; ++attempt) {
+    const std::string candidate = util::sha256_like_hex(pow_material + "|" + std::to_string(attempt));
+    if (util::has_leading_zero_nibbles(candidate, difficulty_nibbles)) {
+      found_nonce = attempt;
+      found_hash = candidate;
+      break;
+    }
+  }
+
+  if (found_hash.empty()) {
+    text << "- Match not found in first " << kPreviewAttempts << " attempts.\n";
+  } else {
+    text << "- First match nonce: " << found_nonce << "\n";
+    text << "- First match hash: " << found_hash << "\n";
+  }
+  return text.str();
+}
+
+std::string AlphaService::soup_address() const {
+  return soup_address_from_cid(crypto_.identity().cid.value);
+}
+
+std::string AlphaService::public_key() const {
+  return crypto_.identity().public_key;
+}
+
+std::string AlphaService::private_key() const {
+  return crypto_.identity().private_key;
+}
+
+MessageSignatureSummary AlphaService::sign_message(std::string_view message) const {
+  MessageSignatureSummary summary;
+  summary.message = std::string{message};
+  summary.signature = crypto_.sign(message);
+  summary.public_key = crypto_.identity().public_key;
+  summary.cid = crypto_.identity().cid.value;
+  summary.address = soup_address_from_cid(summary.cid);
+  summary.wallet_locked = wallet_locked();
+  return summary;
+}
+
+bool AlphaService::verify_message_signature(std::string_view message, std::string_view signature,
+                                            std::string_view public_key) const {
+  if (message.empty() || signature.empty() || public_key.empty()) {
+    return false;
+  }
+  return crypto_.verify(message, signature, public_key);
 }
 
 ModerationStatus AlphaService::moderation_status() const {
@@ -1777,6 +2251,32 @@ std::optional<std::string> AlphaService::resolve_display_name_to_cid(std::string
   return match;
 }
 
+std::optional<std::string> AlphaService::resolve_address_to_cid(std::string_view address) const {
+  const std::string needle = util::trim_copy(address);
+  if (needle.empty()) {
+    return std::nullopt;
+  }
+
+  if (soup_address_from_cid(crypto_.identity().cid.value) == needle) {
+    return crypto_.identity().cid.value;
+  }
+
+  for (const auto& balance : store_.reward_balances()) {
+    if (soup_address_from_cid(balance.cid) == needle) {
+      return balance.cid;
+    }
+  }
+
+  const auto names = observed_display_names_by_cid();
+  for (const auto& [cid, _] : names) {
+    if (soup_address_from_cid(cid) == needle) {
+      return cid;
+    }
+  }
+
+  return std::nullopt;
+}
+
 Result AlphaService::append_locally_and_queue(const EventEnvelope& event) {
   if (event.signature.empty()) {
     return Result::failure("Local event signature is empty. Unlock wallet and retry.");
@@ -1946,7 +2446,7 @@ Result AlphaService::load_or_create_community_profile(std::string_view profile_p
   created.store_path =
       (std::filesystem::path{config_.app_data_dir} / ("db-" + created.community_id)).string();
   created.minimum_post_value = std::max<std::int64_t>(0, config_.minimum_post_value);
-  created.block_reward_units = config_.block_reward_units <= 0 ? 50 : config_.block_reward_units;
+  created.block_reward_units = config_.block_reward_units <= 0 ? 115 : config_.block_reward_units;
   created.moderation_enabled = config_.default_moderation_policy.moderation_enabled;
   created.moderation_require_finality = config_.default_moderation_policy.require_finality_for_actions;
   created.moderation_min_confirmations =
@@ -2024,7 +2524,7 @@ std::optional<CommunityProfile> AlphaService::parse_community_profile_file(std::
                                    : std::max<std::int64_t>(0, config_.minimum_post_value);
   profile.block_reward_units = fields.contains("block_reward_units")
                                    ? std::max<std::int64_t>(1, parse_int64_default(fields["block_reward_units"], 50))
-                                   : std::max<std::int64_t>(1, config_.block_reward_units <= 0 ? 50
+                                   : std::max<std::int64_t>(1, config_.block_reward_units <= 0 ? 115
                                                                                                  : config_.block_reward_units);
   profile.moderation_enabled = !fields.contains("moderation_enabled") || fields["moderation_enabled"] != "0";
   profile.moderation_require_finality =

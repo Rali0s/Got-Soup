@@ -30,6 +30,13 @@ ReferenceEngine::ReferenceEngine()
             "2. Use string_view and optional for APIs\n"
             "3. Adopt ranges-based transformations\n"
             "4. Prefer constexpr and enum class where possible"}},
+          {"smallchange-reference",
+           {"General",
+            "Reference",
+            "smallchange-reference",
+            "SmallChange Reference",
+            "Reference implementation link:\n"
+            "https://github.com/hendrayoga/smallchange"}},
           {"build-crosscompile",
            {"General",
             "Reference",

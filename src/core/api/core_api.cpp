@@ -30,6 +30,10 @@ Result CoreApi::transfer_rewards(const RewardTransferDraft& draft) {
   return service_.transfer_rewards(draft);
 }
 
+Result CoreApi::transfer_rewards_to_address(const RewardTransferAddressDraft& draft) {
+  return service_.transfer_rewards_to_address(draft);
+}
+
 Result CoreApi::set_transport_enabled(AnonymityMode mode, bool enabled) {
   return service_.set_transport_enabled(mode, enabled);
 }
@@ -153,6 +157,39 @@ std::int64_t CoreApi::local_reward_balance() const {
 
 std::vector<RewardBalanceSummary> CoreApi::reward_balances() const {
   return service_.reward_balances();
+}
+
+std::vector<RewardTransactionSummary> CoreApi::reward_transactions() const {
+  return service_.reward_transactions();
+}
+
+ReceiveAddressInfo CoreApi::receive_info() const {
+  return service_.receive_info();
+}
+
+std::string CoreApi::hashspec_console() const {
+  return service_.hashspec_console();
+}
+
+std::string CoreApi::soup_address() const {
+  return service_.soup_address();
+}
+
+std::string CoreApi::public_key() const {
+  return service_.public_key();
+}
+
+std::string CoreApi::private_key() const {
+  return service_.private_key();
+}
+
+MessageSignatureSummary CoreApi::sign_message(std::string_view message) const {
+  return service_.sign_message(message);
+}
+
+bool CoreApi::verify_message_signature(std::string_view message, std::string_view signature,
+                                       std::string_view public_key) const {
+  return service_.verify_message_signature(message, signature, public_key);
 }
 
 ModerationStatus CoreApi::moderation_status() const {

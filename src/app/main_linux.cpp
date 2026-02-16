@@ -2,6 +2,7 @@
 
 #include "core/api/core_api.hpp"
 #include "core/model/app_meta.hpp"
+#include "core/util/hash.hpp"
 
 #ifdef ALPHA_USE_GTK4
 #include <gtk/gtk.h>
@@ -13,9 +14,28 @@ struct AppContext {
   GtkTextBuffer* recipes_buffer = nullptr;
   GtkTextBuffer* profile_buffer = nullptr;
   GtkTextBuffer* rewards_buffer = nullptr;
+  GtkTextBuffer* send_buffer = nullptr;
+  GtkTextBuffer* receive_buffer = nullptr;
+  GtkTextBuffer* transactions_buffer = nullptr;
+  GtkTextBuffer* hashspec_buffer = nullptr;
   GtkTextBuffer* about_buffer = nullptr;
   GtkTextBuffer* settings_buffer = nullptr;
 };
+
+std::string soup_address_from_cid(std::string_view cid) {
+  if (cid.empty()) {
+    return std::string{alpha::kAddressPrefix} + "000000000000000000000000000000000000000";
+  }
+  const std::string digest = alpha::util::sha256_hex(cid);
+  return std::string{alpha::kAddressPrefix} + digest.substr(0, 39);
+}
+
+std::string basil_leaf_summary(std::int64_t basil_units) {
+  const std::int64_t leafs = basil_units * alpha::kLeafsPerBasil;
+  return std::to_string(basil_units) + " " + std::string{alpha::kCurrencyMajorName} + " " +
+         std::string{alpha::kCurrencyMajorSymbol} + " (" + std::to_string(leafs) + " " +
+         std::string{alpha::kCurrencyMinorName} + " " + std::string{alpha::kCurrencyMinorSymbol} + ")";
+}
 
 void fill_texts(AppContext* ctx) {
   (void)ctx->api.sync_tick();
@@ -48,7 +68,9 @@ void fill_texts(AppContext* ctx) {
   profile_text += "Duplicate State: ";
   profile_text += (profile.duplicate_name_detected ? "DUPLICATE DETECTED" : "UNIQUE");
   profile_text += " (count=" + std::to_string(profile.duplicate_name_count) + ")\n";
-  profile_text += "Reward Balance: " + std::to_string(node.local_reward_balance) + "\n";
+  profile_text += std::string{alpha::kNetworkDisplayName} + " Address: " + soup_address_from_cid(profile.cid.value) +
+                  "\n";
+  profile_text += "Reward Balance: " + basil_leaf_summary(node.local_reward_balance) + "\n";
   profile_text += "Mode: " + anonymity.mode + "\n";
   profile_text += anonymity.details + "\n";
   profile_text += "\nProfile controls are available in the macOS and Windows native tabs.\n";
@@ -57,11 +79,11 @@ void fill_texts(AppContext* ctx) {
   std::string rewards_text;
   rewards_text += "Rewards (PoW)\n\n";
   rewards_text += "Network: " + node.p2p.network + "\n";
-  rewards_text += "Max Supply: " + std::to_string(node.db.max_token_supply) + "\n";
-  rewards_text += "Issued: " + std::to_string(node.db.issued_reward_total) + "\n";
-  rewards_text += "Burned Fees: " + std::to_string(node.db.burned_fee_total) + "\n";
-  rewards_text += "Circulating: " + std::to_string(node.db.reward_supply) + "\n";
-  rewards_text += "Local Balance: " + std::to_string(node.local_reward_balance) + "\n";
+  rewards_text += "Max Supply: " + basil_leaf_summary(node.db.max_token_supply) + "\n";
+  rewards_text += "Issued: " + basil_leaf_summary(node.db.issued_reward_total) + "\n";
+  rewards_text += "Burned Fees: " + basil_leaf_summary(node.db.burned_fee_total) + "\n";
+  rewards_text += "Circulating: " + basil_leaf_summary(node.db.reward_supply) + "\n";
+  rewards_text += "Local Balance: " + basil_leaf_summary(node.local_reward_balance) + "\n";
   rewards_text += "Reward Claim Events: " + std::to_string(node.db.reward_claim_event_count) + "\n";
   rewards_text += "Transfer Events: " + std::to_string(node.db.reward_transfer_event_count) + "\n";
   rewards_text += "Invalid Economic Events: " + std::to_string(node.db.invalid_economic_event_count) + "\n";
@@ -74,15 +96,60 @@ void fill_texts(AppContext* ctx) {
   about_text += "Current P2P:Soup Version Build Release: " + std::string{alpha::kAppVersion} + " (" +
                 std::string{alpha::kBuildRelease} + ")\n";
   about_text += "Authors: " + std::string{alpha::kAuthorList} + "\n\n";
+  about_text += "Currency: " + std::string{alpha::kCurrencyMajorName} + " (1.0 " +
+                std::string{alpha::kCurrencyMajorSymbol} + "), " + std::string{alpha::kCurrencyMinorName} +
+                " (0.0000000001 " + std::string{alpha::kCurrencyMinorSymbol} + ")\n";
+  about_text += "Address Prefix: " + std::string{alpha::kAddressPrefix} + "\n\n";
   about_text += "Assets\n";
   about_text += "- About PNG: " + node.data_dir + "/assets/about.png\n";
   about_text += "- Splash PNG: " + node.data_dir + "/assets/tomato_soup.png\n";
+  about_text += "- Leaf Icon PNG: " + node.data_dir + "/assets/leaf_icon.png\n";
   about_text += "Chain: " + node.genesis.chain_id + " (" + node.genesis.network_id + ")\n\n";
   about_text += "Credits\n";
   about_text += "- C++23 modular alpha_core\n";
   about_text += "- Native GTK4 shell\n";
   about_text += "- Planned deps: libp2p, libsodium, SQLCipher, libtor, i2pd\n";
+  about_text += "- Reference: https://github.com/hendrayoga/smallchange\n";
   gtk_text_buffer_set_text(ctx->about_buffer, about_text.c_str(), -1);
+
+  std::string send_text;
+  send_text += "Send\n\n";
+  send_text += "Linux shell uses read-only preview mode for send actions.\n";
+  send_text += "Use macOS/Windows shell to submit send transactions.\n\n";
+  send_text += "Address Prefix: " + std::string{alpha::kAddressPrefix} + "\n";
+  send_text += "Unit: " + std::string{alpha::kCurrencyMajorName} + " / " + std::string{alpha::kCurrencyMinorName} +
+               "\n";
+  gtk_text_buffer_set_text(ctx->send_buffer, send_text.c_str(), -1);
+
+  const auto receive = ctx->api.receive_info();
+  std::string receive_text;
+  receive_text += "Receive\n\n";
+  receive_text += "Display Name: " + receive.display_name + "\n";
+  receive_text += "CID: " + receive.cid + "\n";
+  receive_text += "Address: " + receive.address + "\n\n";
+  receive_text += "PubKey:\n" + receive.public_key + "\n\n";
+  receive_text += "PrivKey:\n" + receive.private_key + "\n";
+  gtk_text_buffer_set_text(ctx->receive_buffer, receive_text.c_str(), -1);
+
+  const auto txs = ctx->api.reward_transactions();
+  std::string tx_text;
+  tx_text += "Transactions History\n\n";
+  if (txs.empty()) {
+    tx_text += "No transfer events found.\n";
+  } else {
+    for (const auto& tx : txs) {
+      tx_text += "- TxID: " + tx.transfer_id + "\n";
+      tx_text += "  From: " + tx.from_address + "\n";
+      tx_text += "  To: " + tx.to_address + "\n";
+      tx_text += "  Amount: " + basil_leaf_summary(tx.amount) + "\n";
+      tx_text += "  Fee Burn: " + basil_leaf_summary(tx.fee) + "\n";
+      tx_text += "  Confirmations: " + std::to_string(tx.confirmation_count) + "\n\n";
+    }
+  }
+  gtk_text_buffer_set_text(ctx->transactions_buffer, tx_text.c_str(), -1);
+
+  const std::string hashspec_text = ctx->api.hashspec_console();
+  gtk_text_buffer_set_text(ctx->hashspec_buffer, hashspec_text.c_str(), -1);
 
   std::string settings_text;
   settings_text += "Settings\n\n";
@@ -105,7 +172,7 @@ void activate(GtkApplication* app, gpointer user_data) {
   auto* ctx = static_cast<AppContext*>(user_data);
 
   GtkWidget* window = gtk_application_window_new(app);
-  gtk_window_set_title(GTK_WINDOW(window), "got-soup::P2P Tomato Soup - Recipe Forum");
+  gtk_window_set_title(GTK_WINDOW(window), "SoupNet::P2P Tomato Soup - Recipe Forum");
   gtk_window_set_default_size(GTK_WINDOW(window), 1200, 760);
 
   GtkWidget* root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
@@ -171,6 +238,26 @@ void activate(GtkApplication* app, gpointer user_data) {
   ctx->rewards_buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(rewards_view));
   gtk_notebook_append_page(GTK_NOTEBOOK(notebook), rewards_view, gtk_label_new("Rewards"));
 
+  GtkWidget* send_view = gtk_text_view_new();
+  gtk_text_view_set_editable(GTK_TEXT_VIEW(send_view), FALSE);
+  ctx->send_buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(send_view));
+  gtk_notebook_append_page(GTK_NOTEBOOK(notebook), send_view, gtk_label_new("Send"));
+
+  GtkWidget* receive_view = gtk_text_view_new();
+  gtk_text_view_set_editable(GTK_TEXT_VIEW(receive_view), FALSE);
+  ctx->receive_buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(receive_view));
+  gtk_notebook_append_page(GTK_NOTEBOOK(notebook), receive_view, gtk_label_new("Receive"));
+
+  GtkWidget* transactions_view = gtk_text_view_new();
+  gtk_text_view_set_editable(GTK_TEXT_VIEW(transactions_view), FALSE);
+  ctx->transactions_buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(transactions_view));
+  gtk_notebook_append_page(GTK_NOTEBOOK(notebook), transactions_view, gtk_label_new("Transactions"));
+
+  GtkWidget* hashspec_view = gtk_text_view_new();
+  gtk_text_view_set_editable(GTK_TEXT_VIEW(hashspec_view), FALSE);
+  ctx->hashspec_buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(hashspec_view));
+  gtk_notebook_append_page(GTK_NOTEBOOK(notebook), hashspec_view, gtk_label_new("HashSpec"));
+
   GtkWidget* about_view = gtk_text_view_new();
   gtk_text_view_set_editable(GTK_TEXT_VIEW(about_view), FALSE);
   ctx->about_buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(about_view));
@@ -190,16 +277,16 @@ void activate(GtkApplication* app, gpointer user_data) {
 int main(int argc, char** argv) {
   AppContext context;
   const alpha::Result init = context.api.init({
-      .app_data_dir = "got-soup-data-linux",
-      .passphrase = "got-soup-dev-passphrase",
+      .app_data_dir = "soupnet-data-linux",
+      .passphrase = "soupnet-dev-passphrase",
       .mode = alpha::AnonymityMode::Tor,
-      .seed_peers = {"seed.got-soup.local:4001"},
-      .seed_peers_mainnet = {"seed.got-soup.local:4001"},
+      .seed_peers = {"seed.got-soup.local:4001", "24.188.147.247:4001"},
+      .seed_peers_mainnet = {"seed.got-soup.local:4001", "24.188.147.247:4001"},
       .seed_peers_testnet = {"seed.got-soup.local:14001"},
       .production_swap = true,
-      .block_interval_seconds = 25,
+      .block_interval_seconds = 150,
       .validation_interval_ticks = 10,
-      .block_reward_units = 50,
+      .block_reward_units = 115,
       .minimum_post_value = 0,
       .genesis_psz_timestamp = "",
       .chain_policy = {
@@ -257,7 +344,7 @@ int main(int argc, char** argv) {
     });
   }
 
-  GtkApplication* app = gtk_application_new("local.got-soup.desktop", G_APPLICATION_DEFAULT_FLAGS);
+  GtkApplication* app = gtk_application_new("local.soupnet.desktop", G_APPLICATION_DEFAULT_FLAGS);
   g_signal_connect(app, "activate", G_CALLBACK(activate), &context);
   const int status = g_application_run(G_APPLICATION(app), argc, argv);
   g_object_unref(app);
@@ -269,16 +356,16 @@ int main(int argc, char** argv) {
 int main() {
   alpha::CoreApi api;
   const alpha::Result init = api.init({
-      .app_data_dir = "got-soup-data-linux",
-      .passphrase = "got-soup-dev-passphrase",
+      .app_data_dir = "soupnet-data-linux",
+      .passphrase = "soupnet-dev-passphrase",
       .mode = alpha::AnonymityMode::Tor,
-      .seed_peers = {"seed.got-soup.local:4001"},
-      .seed_peers_mainnet = {"seed.got-soup.local:4001"},
+      .seed_peers = {"seed.got-soup.local:4001", "24.188.147.247:4001"},
+      .seed_peers_mainnet = {"seed.got-soup.local:4001", "24.188.147.247:4001"},
       .seed_peers_testnet = {"seed.got-soup.local:14001"},
       .production_swap = true,
-      .block_interval_seconds = 25,
+      .block_interval_seconds = 150,
       .validation_interval_ticks = 10,
-      .block_reward_units = 50,
+      .block_reward_units = 115,
       .minimum_post_value = 0,
       .genesis_psz_timestamp = "",
       .chain_policy = {
@@ -309,11 +396,11 @@ int main() {
   });
 
   if (!init.ok) {
-    std::cerr << "got-soup Linux shell init failed: " << init.message << '\n';
+    std::cerr << "SoupNet Linux shell init failed: " << init.message << '\n';
     return 1;
   }
 
-  std::cout << "got-soup Linux target built without GTK4.\n";
+  std::cout << "SoupNet Linux target built without GTK4.\n";
   std::cout << "Install gtk4 development packages and rebuild for native GUI mode.\n";
   return 0;
 }
