@@ -1,195 +1,183 @@
-# SoupNet::P2P Tomato Soup::Got-Soup
+# Got-Soup
 
-Privacy-focused, native desktop, quasi-P2P recipe forum MVP with event-sourced storage, deterministic validation, and Basil/Leaf economy.
+Native C++ desktop software for `SoupNet::P2P Tomato Soup`, a privacy-minded recipe forum and wallet experiment with event-sourced storage, deterministic replay, moderation controls, and a Basil/Leaf reward economy.
 
-## About
+## Overview
 
-SoupNet is a C++23-first application with a shared `alpha_core` and native shells for Windows, macOS, and Linux.
+Got-Soup is built around a shared `alpha_core` and thin native shells for macOS, Windows, and Linux.
 
-- App name: `SoupNet::P2P Tomato Soup::Got-Soup`
+Core ideas:
+
+- event-sourced local storage with replay and backtest validation
+- native desktop UI instead of a web shell
+- wallet identity, signing, backup, recovery, and lock/unlock flows
+- forum-style recipes, threads, replies, ratings, and moderation
+- deterministic block and hash reporting
+- optional headless daemon for remote and cloud-node testing
+
+Current branding/runtime labels:
+
+- App: `SoupNet::P2P Tomato Soup`
 - Network label: `SoupNet`
-- Major unit: `Basil` (`1.0 ⌘`)
-- Minor unit: `Leafs` (`0.0000000001 ❧`)
+- Major unit: `Basil`
+- Minor unit: `Leafs`
 - Address prefix: `S`
-- Hash/address style: SHA256-like addressing over CID-derived identity
 
 Reference inspiration:
 
 - [smallchange](https://github.com/hendrayoga/smallchange)
 
-## Implemented Modules
+## What’s In The Repo
 
-- `src/core/model/`
-  - Domain/event/status/community types.
-- `src/core/crypto/`
-  - Identity vault, sign/verify, backup/import, lock/unlock, nuke.
-- `src/core/storage/`
-  - Append-only event log, blockdata, deterministic materialized views, health/backtest reports.
-- `src/core/transport/`
-  - Tor/I2P provider interface and runtime status adapters.
-- `src/core/p2p/`
-  - Seed-peer + `peers.dat` handling and sync queue.
-- `src/core/service/`
-  - Orchestration for profile, wallet, moderation, rewards, community switching, node controls.
-- `src/core/api/`
-  - Public application API surface for all shells.
-- `src/core/reference_engine.*`
-  - Internal wiki/reference pane integration.
+- [src/core](/Users/premise/Documents/github/Got-Soup/src/core)
+  Shared domain model, crypto, storage, transport, service orchestration, and API surface.
+- [src/app](/Users/premise/Documents/github/Got-Soup/src/app)
+  Native desktop entry points for macOS, Windows, and Linux.
+- [src/daemon](/Users/premise/Documents/github/Got-Soup/src/daemon)
+  `got-soupd`, a headless authenticated JSON-RPC daemon for lite and cloud-node operations.
+- [tests](/Users/premise/Documents/github/Got-Soup/tests)
+  Core integration and regression coverage.
+- [scripts](/Users/premise/Documents/github/Got-Soup/scripts)
+  Build helpers, genesis hashing, and AWS/systemd install tooling.
 
-## Implemented UI Tabs
+## Implemented Features
 
-Shared IA across shells:
+- recipe publishing and search
+- forum threads and replies
+- ratings and thumbs up
+- reward transfers and transaction history
+- wallet receive info, message signing, and address derivation
+- key backup, backup verification, import, recovery, and key nuking
+- moderation flag/hide flows
+- startup backtest and corrupted-store recovery
+- fresh genesis reset support
+- mining template output for future pool/Stratum adapters
+- authenticated local daemon methods for node, wallet, forum, and health operations
 
-- Recipes
-- Forum
-- Upload
-- Profile
-- Rewards
-- Send
-- Receive
-- Transactions
-- Node Status
-- Settings
-- About / Credits
+## Build
 
-Windows and macOS have active send/sign actions. Linux shell currently exposes Send in read-only preview mode and fully exposes Receive/Transactions state views.
+### Prerequisites
 
-## Getting Started
-
-### 1) Prerequisites
-
-- `cmake` (3.24+ recommended)
+- `cmake` 3.24+
 - `ninja`
-- C++23-capable compiler
-- On macOS for Windows cross-build:
-  - `x86_64-w64-mingw32-g++` from `mingw-w64`
+- a C++23/C++2c-capable compiler
 
-Install MinGW toolchain on macOS:
+Optional:
 
-```bash
-brew install mingw-w64
-```
+- `libsodium` for the production crypto path
+- `mingw-w64` for Windows cross-builds from macOS
 
-If brew binaries are not in your shell:
-
-```bash
-eval "$(/opt/homebrew/bin/brew shellenv)"
-```
-
-### 2) Full build (macOS host: Windows + macOS + tests)
-
-```bash
-./build.sh 24
-```
-
-Outputs:
-
-- `dist/got-soup.exe`
-- `dist/got-soup-macos`
-
-### 3) Windows-only cross-build
-
-```bash
-./scripts/build-win.sh 24
-```
-
-Output:
-
-- `build-win/got-soup.exe`
-
-### 4) Linux build
-
-```bash
-./scripts/build-linux.sh 24
-```
-
-Output:
-
-- `build-linux/got-soup`
-
-### 5) Run unit tests
+### Configure
 
 ```bash
 cmake -S . -B build -G Ninja -DALPHA_CPP_PROFILE=24
-cmake --build build --target alpha_unit_tests
+```
+
+### Build Desktop App
+
+```bash
+cmake --build build
+```
+
+Primary outputs:
+
+- `build/got-soup`
+- `build/got-soupd`
+- `build/alpha_unit_tests`
+
+### Run Tests
+
+```bash
 ctest --test-dir build --output-on-failure
 ```
 
-## Runtime Data and Assets
+### Helper Scripts
 
-App data directories are auto-created by each shell, with an `assets/` subfolder.
+- `./build.sh 24`
+- `./scripts/build-linux.sh 24`
+- `./scripts/build-win.sh 24`
 
-Asset files used:
+## Run
 
-- `tomato_soup.png` (splash)
-- `about.png` (about panel art)
-- `leaf_icon.png` (currency icon)
+### Desktop App
 
-Asset seeding logic scans project root and `Art/` for these files and copies into runtime `assets/`.
+```bash
+./build/got-soup
+```
 
-## Send / Receive / Transactions
+### Daemon
 
-### Send
+```bash
+./build/got-soupd --data-dir /tmp/got-soupd --port 4888 --token-file /tmp/got-soupd/token
+```
 
-- Send to SoupNet address (`S...`) with amount and memo.
-- Amount is integer Basil units.
-- Transfer burn fee is applied by policy.
-- Transfer events are signed and appended to event log.
+Example JSON-RPC call:
 
-### Receive
+```bash
+TOKEN=$(cat /tmp/got-soupd/token)
+curl -s \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"node.status","params":{}}' \
+  http://127.0.0.1:4888/rpc
+```
 
-- Shows:
-  - Display name
-  - CID
-  - SoupNet address
-  - Public key
-  - Private key
+## Genesis And Network
 
-### Transactions
+Current default mainnet genesis:
 
-- Event-backed history of reward transfers.
-- Includes:
-  - transfer ID / event ID
-  - from/to addresses
-  - amount
-  - burned fee
-  - timestamp
-  - confirmations
+- Chain ID: `got-soup-mainnet-v3`
+- Merkle Root: `3841f540d53967b51a1eab6bfd50be5feb0cab2323fd7c1bda44795c400352fd`
+- Block Hash: `20d14caaebca64e012c09fdacbbe2fcfb1def9fe083512591879dce30f090cbf`
+- Seed peer: `24.188.147.247:4001`
 
-## Message Signatures
+Genesis helper:
 
-Implemented in core API and desktop shells:
+```bash
+python3 scripts/genesis_hasher.py --pretty
+```
 
-- Sign arbitrary message payloads with current local key.
-- Output includes:
-  - message
-  - signature
-  - CID/address
-  - public key
-- Verification API available by message + signature + public key.
+Custom spec example:
 
-## Node Status and Control
+```bash
+python3 scripts/genesis_hasher.py \
+  --chain-id got-soup-mainnet-v4 \
+  --network-id mainnet \
+  --psz-timestamp "Custom genesis timestamp" \
+  --seed-peer 1.2.3.4:4001 \
+  --pretty
+```
 
-- Tor and I2P toggles
-- Active transport selector
-- Alpha test mode (`127.0.0.1`) toggle
-- Peer management (`peers.dat`, add/reload)
-- DB health and consensus/timeline hashes
-- Block, finality, checkpoint, and validation limits visibility
-- Community profile switching (`*.dat`)
+## AWS / Cloud Node
 
-## Community and Profile Notes
+Plain binary + `systemd` deployment tooling is included for Ubuntu-style hosts.
 
-- Core topics and community posts are separated in model and UI.
-- Immortal display-name flow is enforced through profile APIs.
-- Duplicate-name policy is configurable.
-- Key backup/import/recovery/nuke flows are implemented.
+Create a release bundle:
 
-## Known Build Names
+```bash
+./scripts/aws_release_bundle.sh
+```
 
-Current binary filenames remain:
+Install on the target machine:
 
-- `got-soup` (macOS/Linux)
-- `got-soup.exe` (Windows)
+```bash
+sudo ./scripts/install_got_soupd.sh
+```
 
-Branding/runtime labels are SoupNet-branded in-app.
+That flow:
+
+- builds and installs `got-soupd`
+- creates a token file
+- writes a `systemd` service
+- enables the service
+- prints a suggested public peer entry for `peers.dat`
+
+## Runtime Notes
+
+- app/runtime data is intentionally local and mutable
+- the repo ignores generated stores, backups, recovery state, build outputs, and daemon tokens
+- if the fresh genesis release tag changes, existing runtime state may be quarantined and recreated on next launch
+
+## Status
+
+This is still an active experimental codebase. The core is farther along than the desktop polish, and the daemon/cloud-node path is intentionally simple so it can be tested and iterated quickly.

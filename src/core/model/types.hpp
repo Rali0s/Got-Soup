@@ -250,6 +250,9 @@ struct DbHealthReport {
   std::uint64_t checkpoint_interval_blocks = 0;
   std::uint64_t checkpoint_confirmations = 0;
   std::size_t checkpoint_count = 0;
+  std::uint64_t last_checkpoint_block_index = 0;
+  std::string last_checkpoint_block_hash;
+  std::int64_t last_checkpoint_opened_unix = 0;
   std::size_t max_block_events = 0;
   std::size_t max_block_bytes = 0;
   std::size_t max_event_bytes = 0;
@@ -351,12 +354,37 @@ struct GenesisSpec {
   std::vector<InitialAllocation> initial_allocations;
 };
 
+struct MiningTemplate {
+  std::string chain_id;
+  std::string network_id;
+  std::string community_id;
+  std::string miner_cid;
+  std::string algorithm = "sha256-like";
+  std::string pool_protocol_hint = "stratum-adapter";
+  std::uint64_t next_block_index = 0;
+  std::int64_t next_open_unix = 0;
+  std::string prev_hash;
+  std::string merkle_root;
+  std::string content_hash;
+  std::string anticipated_block_hash;
+  std::size_t provisional_event_count = 0;
+  int difficulty_nibbles = 0;
+  std::string pow_material;
+  std::string sample_nonce_hash;
+};
+
 struct WalletStatus {
   bool locked = false;
   bool destroyed = false;
   bool recovery_required = false;
+  bool backup_exists = false;
+  bool backup_verified = false;
+  bool backup_required = true;
+  bool onboarding_complete = false;
   std::string vault_path;
   std::string backup_last_path;
+  std::string crypto_mode;
+  std::int64_t backup_last_unix = 0;
   std::int64_t last_unlocked_unix = 0;
   std::int64_t last_locked_unix = 0;
 };
@@ -378,19 +406,19 @@ struct InitConfig {
   std::int64_t block_reward_units = 115;
   std::int64_t minimum_post_value = 0;
   std::string genesis_psz_timestamp;
-  std::string mainnet_chain_id = "got-soup-mainnet-v1";
+  std::string mainnet_chain_id = "got-soup-mainnet-v3";
   std::string testnet_chain_id = "got-soup-testnet-v1";
   std::string mainnet_genesis_psz_timestamp =
-      "Feb. 16 2026 - 07:18 - 1771244337 - 'Europe's earnings gain pace while lofty valuations cap rewards' - "
-      "https://www.reuters.com/business/finance/europes-earnings-gain-pace-while-lofty-valuations-cap-rewards-2026-02-16/";
+      "Apr 14, 2026, 5:08 AM ET//Anthropic discussing its powerful AI model Mythos with US: report//"
+      "https://seekingalpha.com/news/4574628-anthropic-discussing-its-powerful-ai-model-mythos-with-us";
   std::string testnet_genesis_psz_timestamp =
       "Got Soup::P2P Tomato Soup testnet genesis | 2026-02-14";
   std::string mainnet_genesis_merkle_root =
-      "a2471d6dbbdf47d3286d519c877eb41c9e95c1e260dc40940fbfc2d1bc037fb3";
+      "3841f540d53967b51a1eab6bfd50be5feb0cab2323fd7c1bda44795c400352fd";
   std::string testnet_genesis_merkle_root =
       "15857bf7a332e27ac17388b05300a0b3b493f0fda96e1dae3e2b9fec3fb8b6bd";
   std::string mainnet_genesis_block_hash =
-      "f4139d244257b46edef309b2dee362ed250980de99e3a43a0679f44cc7b2d978";
+      "20d14caaebca64e012c09fdacbbe2fcfb1def9fe083512591879dce30f090cbf";
   std::string testnet_genesis_block_hash =
       "ead35284e7ce7d379a08e0555e70a6e238a652e6fbdbae6a6b3fbfaf5eb4cd30";
   std::vector<InitialAllocation> mainnet_initial_allocations;
@@ -407,6 +435,7 @@ struct InitConfig {
   std::uint64_t prune_keep_recent_blocks = 4096;
   std::uint16_t p2p_mainnet_port = 4001;
   std::uint16_t p2p_testnet_port = 14001;
+  std::string fresh_genesis_release_tag = "fresh-genesis-reset-v3";
 };
 
 }  // namespace alpha

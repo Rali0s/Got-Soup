@@ -36,8 +36,9 @@ constexpr int kForumViewId = 1009;
 constexpr int kForumThreadTitleId = 1010;
 constexpr int kForumThreadBodyId = 1011;
 constexpr int kForumCreateThreadId = 1012;
-constexpr int kForumReplyBodyId = 1013;
-constexpr int kForumCreateReplyId = 1014;
+constexpr int kForumThreadSelectorId = 1013;
+constexpr int kForumReplyBodyId = 1014;
+constexpr int kForumCreateReplyId = 1015;
 constexpr int kUploadTitleId = 1015;
 constexpr int kUploadCategoryId = 1016;
 constexpr int kUploadBodyId = 1017;
@@ -70,6 +71,7 @@ constexpr int kSettingsRecoverLocalPassId = 1060;
 constexpr int kSettingsRecoverWalletId = 1061;
 constexpr int kSettingsValidateNowId = 1062;
 constexpr int kSettingsDevModeToggleId = 1073;
+constexpr int kReceiveRevealButtonId = 1074;
 constexpr int kSendAddressEditId = 1063;
 constexpr int kSendAmountEditId = 1064;
 constexpr int kSendMemoEditId = 1065;
@@ -117,6 +119,7 @@ struct AppState {
 
   std::vector<std::string> opening_keys;
   std::vector<alpha::RecipeSummary> recipes;
+  std::vector<alpha::ThreadSummary> current_threads;
 
   HWND search_edit = nullptr;
   HWND close_button = nullptr;
@@ -134,6 +137,7 @@ struct AppState {
   HWND forum_thread_title = nullptr;
   HWND forum_thread_body = nullptr;
   HWND forum_create_thread = nullptr;
+  HWND forum_thread_selector = nullptr;
   HWND forum_reply_body = nullptr;
   HWND forum_create_reply = nullptr;
   HWND upload_title = nullptr;
@@ -163,6 +167,7 @@ struct AppState {
   HWND send_memo_edit = nullptr;
   HWND send_button = nullptr;
   HWND receive_view = nullptr;
+  HWND receive_reveal_button = nullptr;
   HWND transactions_view = nullptr;
   HWND sign_message_edit = nullptr;
   HWND sign_button = nullptr;
@@ -194,6 +199,7 @@ struct AppState {
   HWND node_community_apply_button = nullptr;
 
   bool developer_mode = false;
+  bool receive_private_key_visible = false;
   std::string ui_mode_file_path;
 };
 
@@ -266,6 +272,35 @@ std::wstring read_window_text(HWND control) {
   return out;
 }
 
+std::string trim_copy(std::string_view text) {
+  size_t start = 0;
+  while (start < text.size() && std::isspace(static_cast<unsigned char>(text[start]))) {
+    ++start;
+  }
+  size_t end = text.size();
+  while (end > start && std::isspace(static_cast<unsigned char>(text[end - 1]))) {
+    --end;
+  }
+  return std::string{text.substr(start, end - start)};
+}
+
+bool is_blank_or_template(std::string_view text, std::initializer_list<std::string_view> templates = {}) {
+  const std::string trimmed = trim_copy(text);
+  if (trimmed.empty()) {
+    return true;
+  }
+  for (const auto candidate : templates) {
+    if (trimmed == candidate) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void set_cue_banner(HWND control, const wchar_t* text) {
+  SendMessageW(control, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(text));
+}
+
 std::string selected_combo_text(HWND control) {
   const LRESULT selected = SendMessageW(control, CB_GETCURSEL, 0, 0);
   if (selected == CB_ERR) {
@@ -281,6 +316,14 @@ std::string selected_combo_text(HWND control) {
   SendMessageW(control, CB_GETLBTEXT, selected, reinterpret_cast<LPARAM>(out.data()));
   out.resize(static_cast<size_t>(len));
   return wide_to_utf8(out);
+}
+
+const alpha::ThreadSummary* selected_thread(const AppState* state) {
+  const LRESULT index = SendMessageW(state->forum_thread_selector, CB_GETCURSEL, 0, 0);
+  if (index == CB_ERR || static_cast<size_t>(index) >= state->current_threads.size()) {
+    return nullptr;
+  }
+  return &state->current_threads[static_cast<size_t>(index)];
 }
 
 void set_edit_text(HWND control, std::string_view text) {
@@ -482,34 +525,59 @@ void refresh_forum_view(AppState* state) {
 
   const alpha::RecipeSummary* recipe = selected_recipe(state);
   if (recipe == nullptr) {
+    state->current_threads.clear();
+    SendMessageW(state->forum_thread_selector, CB_RESETCONTENT, 0, 0);
     forum += "Select a recipe in Recipes tab to inspect forum threads.\r\n";
     set_edit_text(state->forum_view, forum);
     return;
   }
 
-  const auto threads = state->api.threads(recipe->recipe_id);
+  const std::string previous_thread_id =
+      selected_thread(state) != nullptr ? selected_thread(state)->thread_id : std::string{};
+  state->current_threads = state->api.threads(recipe->recipe_id);
+  SendMessageW(state->forum_thread_selector, CB_RESETCONTENT, 0, 0);
+  int selected_index = -1;
+  for (size_t i = 0; i < state->current_threads.size(); ++i) {
+    const auto& thread = state->current_threads[i];
+    std::string label = thread.title + " (" + std::to_string(thread.reply_count) + " replies)";
+    const std::wstring wide = utf8_to_wide(label);
+    SendMessageW(state->forum_thread_selector, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(wide.c_str()));
+    if (!previous_thread_id.empty() && thread.thread_id == previous_thread_id) {
+      selected_index = static_cast<int>(i);
+    }
+  }
+  if (!state->current_threads.empty()) {
+    if (selected_index < 0) {
+      selected_index = 0;
+    }
+    SendMessageW(state->forum_thread_selector, CB_SETCURSEL, selected_index, 0);
+  }
+
+  const auto* thread_target = selected_thread(state);
 
   forum += "Recipe: " + recipe->title + "\r\n";
   forum += "Recipe ID: " + recipe->recipe_id + "\r\n";
   forum += "Segment: ";
   forum += (recipe->core_topic ? "CORE TOPIC" : "COMMUNITY POST");
   forum += "\r\n";
-  forum += "Threads: " + std::to_string(threads.size()) + "\r\n\r\n";
+  forum += "Threads: " + std::to_string(state->current_threads.size()) + "\r\n\r\n";
 
-  for (const auto& thread : threads) {
+  for (const auto& thread : state->current_threads) {
     forum += "- " + thread.title + " [thread_id=" + thread.thread_id + "]";
     forum += " (replies: " + std::to_string(thread.reply_count) + ")\r\n";
   }
 
-  if (threads.empty()) {
+  if (state->current_threads.empty()) {
     forum += "No threads yet. Use the fields below to create a thread.\r\n";
+  } else if (thread_target == nullptr) {
+    forum += "\r\nChoose a thread above to inspect replies.\r\n";
   } else {
-    const auto latest_replies = state->api.replies(threads.front().thread_id);
-    forum += "\r\nLatest thread target for reply: " + threads.front().thread_id + "\r\n";
+    const auto latest_replies = state->api.replies(thread_target->thread_id);
+    forum += "\r\nReply target: " + thread_target->title + " [" + thread_target->thread_id + "]\r\n";
     if (latest_replies.empty()) {
       forum += "No replies yet. Use the reply field below.\r\n";
     } else {
-      forum += "Replies in latest thread:\r\n";
+      forum += "Replies in selected thread:\r\n";
       for (const auto& reply : latest_replies) {
         forum += "  * [" + reply.reply_id + "] " + reply.author_cid + "\r\n";
       }
@@ -669,6 +737,10 @@ void refresh_node_status_view(AppState* state) {
   text += "Checkpoint interval: " + std::to_string(node.db.checkpoint_interval_blocks) + "\r\n";
   text += "Checkpoint confirmations: " + std::to_string(node.db.checkpoint_confirmations) + "\r\n";
   text += "Checkpoint count: " + std::to_string(node.db.checkpoint_count) + "\r\n";
+  text += "Last checkpoint block: " + std::to_string(node.db.last_checkpoint_block_index) + "\r\n";
+  if (!node.db.last_checkpoint_block_hash.empty()) {
+    text += "Last checkpoint hash: " + node.db.last_checkpoint_block_hash + "\r\n";
+  }
   text += "Blockdata format: v" + std::to_string(node.db.blockdata_format_version) + "\r\n";
   text += "Recovered from corruption: ";
   text += (node.db.recovered_from_corruption ? "YES" : "NO");
@@ -768,8 +840,12 @@ void refresh_send_receive_views(AppState* state) {
   receive_text += "CID: " + receive.cid + "\r\n";
   receive_text += "Address: " + receive.address + "\r\n\r\n";
   receive_text += "PubKey:\r\n" + receive.public_key + "\r\n\r\n";
-  receive_text += "PrivKey:\r\n" + receive.private_key + "\r\n";
+  receive_text += "PrivKey:\r\n";
+  receive_text += state->receive_private_key_visible ? receive.private_key : "[hidden - click Reveal Private Key]";
+  receive_text += "\r\n";
   set_edit_text(state->receive_view, receive_text);
+  SetWindowTextW(state->receive_reveal_button,
+                 state->receive_private_key_visible ? L"Hide Private Key" : L"Reveal Private Key");
 }
 
 void refresh_transactions_view(AppState* state) {
@@ -828,6 +904,11 @@ void refresh_settings_view(AppState* state) {
   text += "Max reorg depth: " + std::to_string(node.chain_policy.max_reorg_depth) + "\r\n";
   text += "Checkpoint interval: " + std::to_string(node.chain_policy.checkpoint_interval_blocks) + "\r\n";
   text += "Checkpoint confirmations: " + std::to_string(node.chain_policy.checkpoint_confirmations) + "\r\n\r\n";
+  text += "Last checkpoint block: " + std::to_string(node.db.last_checkpoint_block_index) + "\r\n";
+  if (!node.db.last_checkpoint_block_hash.empty()) {
+    text += "Last checkpoint hash: " + node.db.last_checkpoint_block_hash + "\r\n";
+  }
+  text += "\r\n";
 
   text += "Validation Limits\r\n";
   text += "Max block events: " + std::to_string(node.validation_limits.max_block_events) + "\r\n";
@@ -919,7 +1000,7 @@ void refresh_tab_visibility(AppState* state) {
     ShowWindow(control, visible ? SW_SHOW : SW_HIDE);
   };
 
-  show(state->search_edit, state->developer_mode);
+  show(state->search_edit, true);
   show(state->parent_menu, state->developer_mode);
   show(state->secondary_menu, state->developer_mode);
   show(state->opening_list, state->developer_mode);
@@ -944,22 +1025,23 @@ void refresh_tab_visibility(AppState* state) {
   show(state->recipe_rate_button, is_recipes && state->developer_mode);
 
   show(state->forum_view, is_forum);
+  show(state->forum_thread_selector, is_forum);
   show(state->forum_thread_title, is_forum);
   show(state->forum_thread_body, is_forum);
   show(state->forum_create_thread, is_forum);
   show(state->forum_reply_body, is_forum);
   show(state->forum_create_reply, is_forum);
 
-  show(state->upload_title, is_upload && state->developer_mode);
-  show(state->upload_category, is_upload && state->developer_mode);
-  show(state->upload_body, is_upload && state->developer_mode);
-  show(state->upload_submit, is_upload && state->developer_mode);
+  show(state->upload_title, is_upload);
+  show(state->upload_category, is_upload);
+  show(state->upload_body, is_upload);
+  show(state->upload_submit, is_upload);
 
   show(state->profile_view, is_profile);
-  show(state->profile_name_edit, is_profile && state->developer_mode);
-  show(state->profile_set_name_button, is_profile && state->developer_mode);
-  show(state->profile_duplicate_policy_toggle, is_profile && state->developer_mode);
-  show(state->profile_apply_policy_button, is_profile && state->developer_mode);
+  show(state->profile_name_edit, is_profile);
+  show(state->profile_set_name_button, is_profile);
+  show(state->profile_duplicate_policy_toggle, is_profile);
+  show(state->profile_apply_policy_button, is_profile);
   show(state->profile_cipher_password_edit, is_profile && state->developer_mode);
   show(state->profile_cipher_salt_edit, is_profile && state->developer_mode);
   show(state->profile_cipher_apply_button, is_profile && state->developer_mode);
@@ -974,14 +1056,15 @@ void refresh_tab_visibility(AppState* state) {
   show(state->profile_nuke_button, is_profile && state->developer_mode);
 
   show(state->rewards_view, is_rewards);
-  show(state->send_address_edit, is_send && state->developer_mode);
-  show(state->send_amount_edit, is_send && state->developer_mode);
-  show(state->send_memo_edit, is_send && state->developer_mode);
-  show(state->send_button, is_send && state->developer_mode);
-  show(state->sign_message_edit, is_send && state->developer_mode);
-  show(state->sign_button, is_send && state->developer_mode);
-  show(state->signature_output_view, is_send && state->developer_mode);
+  show(state->send_address_edit, is_send);
+  show(state->send_amount_edit, is_send);
+  show(state->send_memo_edit, is_send);
+  show(state->send_button, is_send);
+  show(state->sign_message_edit, is_send);
+  show(state->sign_button, is_send);
+  show(state->signature_output_view, is_send);
   show(state->receive_view, is_receive);
+  show(state->receive_reveal_button, is_receive);
   show(state->transactions_view, is_transactions);
   show(state->hashspec_view, is_hashspec);
 
@@ -991,7 +1074,7 @@ void refresh_tab_visibility(AppState* state) {
   show(state->node_localhost_toggle, is_node && state->developer_mode);
   show(state->node_mode_combo, is_node && state->developer_mode);
   show(state->node_apply_button, is_node && state->developer_mode);
-  show(state->node_refresh_button, is_node && state->developer_mode);
+  show(state->node_refresh_button, is_node);
   show(state->node_peer_edit, is_node && state->developer_mode);
   show(state->node_peer_add_button, is_node && state->developer_mode);
   show(state->node_community_id_edit, is_node && state->developer_mode);
@@ -999,14 +1082,14 @@ void refresh_tab_visibility(AppState* state) {
   show(state->node_community_apply_button, is_node && state->developer_mode);
 
   show(state->settings_view, is_settings);
-  show(state->settings_lock_wallet_button, is_settings && state->developer_mode);
-  show(state->settings_unlock_password_edit, is_settings && state->developer_mode);
-  show(state->settings_unlock_wallet_button, is_settings && state->developer_mode);
+  show(state->settings_lock_wallet_button, is_settings);
+  show(state->settings_unlock_password_edit, is_settings);
+  show(state->settings_unlock_wallet_button, is_settings);
   show(state->settings_recover_path_edit, is_settings && state->developer_mode);
   show(state->settings_recover_backup_password_edit, is_settings && state->developer_mode);
   show(state->settings_recover_local_password_edit, is_settings && state->developer_mode);
   show(state->settings_recover_wallet_button, is_settings && state->developer_mode);
-  show(state->settings_validate_now_button, is_settings && state->developer_mode);
+  show(state->settings_validate_now_button, is_settings);
   show(state->settings_dev_mode_toggle_button, is_settings);
 
   show(state->about_view, is_about);
@@ -1024,7 +1107,7 @@ void layout_controls(AppState* state, int width, int height) {
   MoveWindow(state->search_edit, margin, margin, search_width, top_height, TRUE);
   MoveWindow(state->close_button, margin * 2 + search_width, margin, close_width, top_height, TRUE);
 
-  const int body_y = state->developer_mode ? (margin + top_height + margin) : margin;
+  const int body_y = margin + top_height + margin;
   const int body_h = std::max(120, height - body_y - margin);
 
   MoveWindow(state->parent_menu, margin, body_y, left_width, combo_height, TRUE);
@@ -1064,15 +1147,16 @@ void layout_controls(AppState* state, int width, int height) {
   MoveWindow(state->forum_view, tab_rect.left, tab_rect.top, page_w, forum_summary_h, TRUE);
 
   const int forum_controls_y = tab_rect.top + forum_summary_h + 8;
-  MoveWindow(state->forum_thread_title, tab_rect.left, forum_controls_y, std::max(120, page_w - 130),
+  MoveWindow(state->forum_thread_selector, tab_rect.left, forum_controls_y, page_w, 220, TRUE);
+  MoveWindow(state->forum_thread_title, tab_rect.left, forum_controls_y + 30, std::max(120, page_w - 130),
              24, TRUE);
   MoveWindow(state->forum_create_thread, tab_rect.left + std::max(120, page_w - 130) + 8,
-             forum_controls_y, 120, 24, TRUE);
-  MoveWindow(state->forum_thread_body, tab_rect.left, forum_controls_y + 28, page_w, 64, TRUE);
-  MoveWindow(state->forum_reply_body, tab_rect.left, forum_controls_y + 98, std::max(120, page_w - 130),
-             std::max(48, page_h - forum_summary_h - 106), TRUE);
+             forum_controls_y + 30, 120, 24, TRUE);
+  MoveWindow(state->forum_thread_body, tab_rect.left, forum_controls_y + 58, page_w, 64, TRUE);
+  MoveWindow(state->forum_reply_body, tab_rect.left, forum_controls_y + 128, std::max(120, page_w - 130),
+             std::max(48, page_h - forum_summary_h - 136), TRUE);
   MoveWindow(state->forum_create_reply, tab_rect.left + std::max(120, page_w - 130) + 8,
-             forum_controls_y + 98, 120, 24, TRUE);
+             forum_controls_y + 128, 120, 24, TRUE);
 
   constexpr int label_h = 22;
   const int upload_top = tab_rect.top;
@@ -1175,7 +1259,8 @@ void layout_controls(AppState* state, int width, int height) {
   MoveWindow(state->signature_output_view, tab_rect.left, send_top + 126, page_w, std::max(80, page_h - 126), TRUE);
 
   MoveWindow(state->rewards_view, tab_rect.left, tab_rect.top, page_w, page_h, TRUE);
-  MoveWindow(state->receive_view, tab_rect.left, tab_rect.top, page_w, page_h, TRUE);
+  MoveWindow(state->receive_reveal_button, tab_rect.left, tab_rect.top, 150, 24, TRUE);
+  MoveWindow(state->receive_view, tab_rect.left, tab_rect.top + 30, page_w, std::max(80, page_h - 30), TRUE);
   MoveWindow(state->transactions_view, tab_rect.left, tab_rect.top, page_w, page_h, TRUE);
   MoveWindow(state->hashspec_view, tab_rect.left, tab_rect.top, page_w, page_h, TRUE);
   MoveWindow(state->about_view, tab_rect.left, tab_rect.top, page_w, page_h, TRUE);
@@ -1241,8 +1326,12 @@ void create_forum_thread_from_ui(HWND hwnd, AppState* state) {
   }
 
   const auto& recipe = state->recipes[static_cast<size_t>(recipe_index)];
-  const std::string title = wide_to_utf8(read_window_text(state->forum_thread_title));
-  const std::string body = wide_to_utf8(read_window_text(state->forum_thread_body));
+  const std::string title = trim_copy(wide_to_utf8(read_window_text(state->forum_thread_title)));
+  const std::string body = trim_copy(wide_to_utf8(read_window_text(state->forum_thread_body)));
+  if (is_blank_or_template(title, {"Thread title"}) || is_blank_or_template(body, {"Thread markdown"})) {
+    MessageBoxW(hwnd, L"Thread title and body are required.", L"Create Thread", MB_OK | MB_ICONWARNING);
+    return;
+  }
 
   const alpha::Result result = state->api.create_thread({
       .recipe_id = recipe.recipe_id,
@@ -1275,9 +1364,19 @@ void create_forum_reply_from_ui(HWND hwnd, AppState* state) {
     return;
   }
 
-  const std::string body = wide_to_utf8(read_window_text(state->forum_reply_body));
+  const auto* thread = selected_thread(state);
+  if (thread == nullptr) {
+    MessageBoxW(hwnd, L"Choose the thread you want to reply to first.", L"Forum", MB_OK | MB_ICONWARNING);
+    return;
+  }
+
+  const std::string body = trim_copy(wide_to_utf8(read_window_text(state->forum_reply_body)));
+  if (is_blank_or_template(body, {"Reply markdown"})) {
+    MessageBoxW(hwnd, L"Reply body is required.", L"Create Reply", MB_OK | MB_ICONWARNING);
+    return;
+  }
   const alpha::Result result = state->api.create_reply({
-      .thread_id = threads.front().thread_id,
+      .thread_id = thread->thread_id,
       .markdown = body,
   });
   if (!result.ok) {
@@ -1378,7 +1477,11 @@ void apply_node_controls(HWND hwnd, AppState* state) {
 }
 
 void add_peer_from_ui(HWND hwnd, AppState* state) {
-  const std::string peer = wide_to_utf8(read_window_text(state->node_peer_edit));
+  const std::string peer = trim_copy(wide_to_utf8(read_window_text(state->node_peer_edit)));
+  if (is_blank_or_template(peer, {"peer.host:port"})) {
+    MessageBoxW(hwnd, L"Peer host:port is required.", L"Add Peer", MB_OK | MB_ICONWARNING);
+    return;
+  }
   const alpha::Result result = state->api.add_peer(peer);
   if (!result.ok) {
     show_result_if_error(hwnd, result, L"Add Peer");
@@ -1390,8 +1493,13 @@ void add_peer_from_ui(HWND hwnd, AppState* state) {
 }
 
 void apply_community_from_ui(HWND hwnd, AppState* state) {
-  const std::string community_id = wide_to_utf8(read_window_text(state->node_community_id_edit));
-  const std::string community_name = wide_to_utf8(read_window_text(state->node_community_name_edit));
+  const std::string community_id = trim_copy(wide_to_utf8(read_window_text(state->node_community_id_edit)));
+  const std::string community_name = trim_copy(wide_to_utf8(read_window_text(state->node_community_name_edit)));
+  if (community_id.empty() || community_name.empty()) {
+    MessageBoxW(hwnd, L"Community ID and community name are required.", L"Community Profile",
+                MB_OK | MB_ICONWARNING);
+    return;
+  }
 
   const alpha::Result result = state->api.use_community_profile(community_id, community_name, "");
   if (!result.ok) {
@@ -1406,9 +1514,13 @@ void apply_community_from_ui(HWND hwnd, AppState* state) {
 }
 
 void apply_profile_name_from_ui(HWND hwnd, AppState* state) {
-  const std::string name = wide_to_utf8(read_window_text(state->profile_name_edit));
+  const std::string name = trim_copy(wide_to_utf8(read_window_text(state->profile_name_edit)));
   const std::string cipher_password = wide_to_utf8(read_window_text(state->profile_cipher_password_edit));
-  const std::string cipher_salt = wide_to_utf8(read_window_text(state->profile_cipher_salt_edit));
+  const std::string cipher_salt = trim_copy(wide_to_utf8(read_window_text(state->profile_cipher_salt_edit)));
+  if (name.empty()) {
+    MessageBoxW(hwnd, L"Display name is required.", L"Set Immortal", MB_OK | MB_ICONWARNING);
+    return;
+  }
 
   const alpha::Result result =
       state->api.set_immortal_name_with_cipher(name, cipher_password, cipher_salt);
@@ -1435,7 +1547,11 @@ void apply_duplicate_policy_from_ui(HWND hwnd, AppState* state) {
 
 void apply_profile_cipher_from_ui(HWND hwnd, AppState* state) {
   const std::string password = wide_to_utf8(read_window_text(state->profile_cipher_password_edit));
-  const std::string salt = wide_to_utf8(read_window_text(state->profile_cipher_salt_edit));
+  const std::string salt = trim_copy(wide_to_utf8(read_window_text(state->profile_cipher_salt_edit)));
+  if (password.empty() || salt.empty()) {
+    MessageBoxW(hwnd, L"Cipher password and salt are required.", L"Cipher Key", MB_OK | MB_ICONWARNING);
+    return;
+  }
   const alpha::Result result = state->api.set_profile_cipher_password(password, salt);
   if (!result.ok) {
     show_result_if_error(hwnd, result, L"Cipher Key");
@@ -1457,9 +1573,13 @@ void update_key_to_peers_from_ui(HWND hwnd, AppState* state) {
 }
 
 void export_key_backup_from_ui(HWND hwnd, AppState* state) {
-  const std::string path = wide_to_utf8(read_window_text(state->profile_export_path_edit));
+  const std::string path = trim_copy(wide_to_utf8(read_window_text(state->profile_export_path_edit)));
   const std::string password = wide_to_utf8(read_window_text(state->profile_export_password_edit));
-  const std::string salt = wide_to_utf8(read_window_text(state->profile_export_salt_edit));
+  const std::string salt = trim_copy(wide_to_utf8(read_window_text(state->profile_export_salt_edit)));
+  if (path.empty() || password.empty() || salt.empty()) {
+    MessageBoxW(hwnd, L"Backup path, password, and salt are required.", L"Export Key", MB_OK | MB_ICONWARNING);
+    return;
+  }
   const alpha::Result result = state->api.export_key_backup(path, password, salt);
   if (!result.ok) {
     show_result_if_error(hwnd, result, L"Export Key");
@@ -1470,8 +1590,12 @@ void export_key_backup_from_ui(HWND hwnd, AppState* state) {
 }
 
 void import_key_backup_from_ui(HWND hwnd, AppState* state) {
-  const std::string path = wide_to_utf8(read_window_text(state->profile_import_path_edit));
+  const std::string path = trim_copy(wide_to_utf8(read_window_text(state->profile_import_path_edit)));
   const std::string password = wide_to_utf8(read_window_text(state->profile_import_password_edit));
+  if (path.empty() || password.empty()) {
+    MessageBoxW(hwnd, L"Backup path and password are required.", L"Import Key", MB_OK | MB_ICONWARNING);
+    return;
+  }
   const alpha::Result result = state->api.import_key_backup(path, password);
   if (!result.ok) {
     show_result_if_error(hwnd, result, L"Import Key");
@@ -1516,6 +1640,10 @@ void lock_wallet_from_ui(HWND hwnd, AppState* state) {
 
 void unlock_wallet_from_ui(HWND hwnd, AppState* state) {
   const std::string pass = wide_to_utf8(read_window_text(state->settings_unlock_password_edit));
+  if (pass.empty()) {
+    MessageBoxW(hwnd, L"Unlock passphrase is required.", L"Unlock Wallet", MB_OK | MB_ICONWARNING);
+    return;
+  }
   const alpha::Result result = state->api.unlock_wallet(pass);
   if (!result.ok) {
     show_result_if_error(hwnd, result, L"Unlock Wallet");
@@ -1527,11 +1655,16 @@ void unlock_wallet_from_ui(HWND hwnd, AppState* state) {
 }
 
 void recover_wallet_from_ui(HWND hwnd, AppState* state) {
-  const std::string path = wide_to_utf8(read_window_text(state->settings_recover_path_edit));
+  const std::string path = trim_copy(wide_to_utf8(read_window_text(state->settings_recover_path_edit)));
   const std::string backup_pass =
       wide_to_utf8(read_window_text(state->settings_recover_backup_password_edit));
   const std::string local_pass =
       wide_to_utf8(read_window_text(state->settings_recover_local_password_edit));
+  if (path.empty() || backup_pass.empty() || local_pass.empty()) {
+    MessageBoxW(hwnd, L"Recovery path, backup password, and new local password are required.",
+                L"Recover Wallet", MB_OK | MB_ICONWARNING);
+    return;
+  }
   const alpha::Result result = state->api.recover_wallet(path, backup_pass, local_pass);
   if (!result.ok) {
     show_result_if_error(hwnd, result, L"Recover Wallet");
@@ -1555,9 +1688,9 @@ void validate_now_from_ui(HWND hwnd, AppState* state) {
 }
 
 void send_rewards_to_address_from_ui(HWND hwnd, AppState* state) {
-  const std::string address = wide_to_utf8(read_window_text(state->send_address_edit));
-  const std::string amount_text = wide_to_utf8(read_window_text(state->send_amount_edit));
-  const std::string memo = wide_to_utf8(read_window_text(state->send_memo_edit));
+  const std::string address = trim_copy(wide_to_utf8(read_window_text(state->send_address_edit)));
+  const std::string amount_text = trim_copy(wide_to_utf8(read_window_text(state->send_amount_edit)));
+  const std::string memo = trim_copy(wide_to_utf8(read_window_text(state->send_memo_edit)));
   if (address.empty() || amount_text.empty()) {
     MessageBoxW(hwnd, L"Address and amount are required.", L"Send", MB_OK | MB_ICONWARNING);
     return;
@@ -1586,6 +1719,11 @@ void send_rewards_to_address_from_ui(HWND hwnd, AppState* state) {
   refresh_profile_and_about(state);
   refresh_transactions_view(state);
   MessageBoxW(hwnd, L"Transfer broadcast queued.", L"Send", MB_OK | MB_ICONINFORMATION);
+}
+
+void toggle_receive_private_key(HWND, AppState* state) {
+  state->receive_private_key_visible = !state->receive_private_key_visible;
+  refresh_send_receive_views(state);
 }
 
 void sign_message_from_ui(HWND hwnd, AppState* state) {
@@ -1724,12 +1862,12 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_p
                           nullptr);
 
       state->forum_thread_title =
-          CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"Thread title",
+          CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
                           WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 0, 0, 0, 0, hwnd,
                           reinterpret_cast<HMENU>(kForumThreadTitleId), create->hInstance, nullptr);
 
       state->forum_thread_body =
-          CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"Thread markdown",
+          CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
                           WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL, 0, 0, 0,
                           0, hwnd, reinterpret_cast<HMENU>(kForumThreadBodyId), create->hInstance,
                           nullptr);
@@ -1739,8 +1877,13 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_p
                         hwnd, reinterpret_cast<HMENU>(kForumCreateThreadId), create->hInstance,
                         nullptr);
 
+      state->forum_thread_selector =
+          CreateWindowExW(0, L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | WS_VSCROLL | CBS_DROPDOWNLIST,
+                          0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(kForumThreadSelectorId),
+                          create->hInstance, nullptr);
+
       state->forum_reply_body =
-          CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"Reply markdown",
+          CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
                           WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL, 0, 0, 0,
                           0, hwnd, reinterpret_cast<HMENU>(kForumReplyBodyId), create->hInstance,
                           nullptr);
@@ -1750,17 +1893,17 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_p
                         hwnd, reinterpret_cast<HMENU>(kForumCreateReplyId), create->hInstance, nullptr);
 
       state->upload_title =
-          CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"Recipe title", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+          CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
                           0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(kUploadTitleId), create->hInstance,
                           nullptr);
 
-      state->upload_category = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"Category",
+      state->upload_category = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
                                                WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 0, 0, 0, 0, hwnd,
                                                reinterpret_cast<HMENU>(kUploadCategoryId), create->hInstance,
                                                nullptr);
 
       state->upload_body =
-          CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"Recipe markdown", WS_CHILD | WS_VISIBLE | WS_VSCROLL |
+          CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_VSCROLL |
                                                                            ES_MULTILINE | ES_AUTOVSCROLL,
                           0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(kUploadBodyId), create->hInstance,
                           nullptr);
@@ -1775,7 +1918,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_p
                           0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(kProfileViewId), create->hInstance,
                           nullptr);
       state->profile_name_edit =
-          CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"Display name (immutable)", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+          CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
                           0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(kProfileNameEditId), create->hInstance,
                           nullptr);
       state->profile_set_name_button =
@@ -1794,7 +1937,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_p
                           0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(kProfileCipherPasswordId), create->hInstance,
                           nullptr);
       state->profile_cipher_salt_edit =
-          CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"cipher-salt", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+          CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
                           0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(kProfileCipherSaltId), create->hInstance,
                           nullptr);
       state->profile_cipher_apply_button =
@@ -1804,7 +1947,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_p
           CreateWindowW(L"BUTTON", L"Update Key to Peers", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0,
                         hwnd, reinterpret_cast<HMENU>(kProfileUpdateKeyId), create->hInstance, nullptr);
       state->profile_export_path_edit =
-          CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"backup/identity-backup.dat",
+          CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
                           WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 0, 0, 0, 0, hwnd,
                           reinterpret_cast<HMENU>(kProfileExportPathId), create->hInstance, nullptr);
       state->profile_export_password_edit =
@@ -1812,13 +1955,13 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_p
                           0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(kProfileExportPasswordId),
                           create->hInstance, nullptr);
       state->profile_export_salt_edit =
-          CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"salt", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 0, 0,
+          CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 0, 0,
                           0, 0, hwnd, reinterpret_cast<HMENU>(kProfileExportSaltId), create->hInstance, nullptr);
       state->profile_export_button =
           CreateWindowW(L"BUTTON", L"Export Key", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd,
                         reinterpret_cast<HMENU>(kProfileExportButtonId), create->hInstance, nullptr);
       state->profile_import_path_edit =
-          CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"backup/identity-backup.dat",
+          CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
                           WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 0, 0, 0, 0, hwnd,
                           reinterpret_cast<HMENU>(kProfileImportPathId), create->hInstance, nullptr);
       state->profile_import_password_edit =
@@ -1843,22 +1986,22 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_p
                           0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(kRewardsViewId), create->hInstance,
                           nullptr);
       state->send_address_edit =
-          CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"SoupNet Address (starts with S)",
+          CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
                           WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 0, 0, 0, 0, hwnd,
                           reinterpret_cast<HMENU>(kSendAddressEditId), create->hInstance, nullptr);
       state->send_amount_edit =
-          CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"Amount (Basil, up to 8 decimals)",
+          CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
                           WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 0, 0, 0, 0, hwnd,
                           reinterpret_cast<HMENU>(kSendAmountEditId), create->hInstance, nullptr);
       state->send_button =
           CreateWindowW(L"BUTTON", L"Send Basil/Leafs", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0,
                         hwnd, reinterpret_cast<HMENU>(kSendButtonId), create->hInstance, nullptr);
       state->send_memo_edit =
-          CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"Memo (optional)",
+          CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
                           WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 0, 0, 0, 0, hwnd,
                           reinterpret_cast<HMENU>(kSendMemoEditId), create->hInstance, nullptr);
       state->sign_message_edit =
-          CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"Message to sign",
+          CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
                           WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 0, 0, 0, 0, hwnd,
                           reinterpret_cast<HMENU>(kSignMessageEditId), create->hInstance, nullptr);
       state->sign_button =
@@ -1874,6 +2017,9 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_p
                                                            ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY,
                           0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(kReceiveViewId), create->hInstance,
                           nullptr);
+      state->receive_reveal_button =
+          CreateWindowW(L"BUTTON", L"Reveal Private Key", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0,
+                        hwnd, reinterpret_cast<HMENU>(kReceiveRevealButtonId), create->hInstance, nullptr);
       state->transactions_view =
           CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_VSCROLL |
                                                            ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY,
@@ -1916,7 +2062,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_p
           CreateWindowW(L"BUTTON", L"Refresh", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd,
                         reinterpret_cast<HMENU>(kNodeRefreshId), create->hInstance, nullptr);
 
-      state->node_peer_edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"peer.host:port",
+      state->node_peer_edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
                                               WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 0, 0, 0, 0, hwnd,
                                               reinterpret_cast<HMENU>(kNodePeerEditId), create->hInstance,
                                               nullptr);
@@ -1924,11 +2070,11 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_p
           CreateWindowW(L"BUTTON", L"Add Peer", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd,
                         reinterpret_cast<HMENU>(kNodeAddPeerId), create->hInstance, nullptr);
 
-      state->node_community_id_edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"recipes",
+      state->node_community_id_edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
                                                       WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 0, 0, 0, 0,
                                                       hwnd, reinterpret_cast<HMENU>(kNodeCommunityIdId),
                                                       create->hInstance, nullptr);
-      state->node_community_name_edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"Recipe Community",
+      state->node_community_name_edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
                                                         WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 0, 0, 0, 0,
                                                         hwnd, reinterpret_cast<HMENU>(kNodeCommunityNameId),
                                                         create->hInstance, nullptr);
@@ -1952,7 +2098,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_p
           CreateWindowW(L"BUTTON", L"Unlock Wallet", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0,
                         hwnd, reinterpret_cast<HMENU>(kSettingsUnlockWalletId), create->hInstance, nullptr);
       state->settings_recover_path_edit =
-          CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"backup/identity-backup.dat",
+          CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
                           WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 0, 0, 0, 0, hwnd,
                           reinterpret_cast<HMENU>(kSettingsRecoverPathId), create->hInstance, nullptr);
       state->settings_recover_backup_password_edit =
@@ -1989,6 +2135,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_p
           state->recipe_rate_combo,
           state->recipe_rate_button,
           state->forum_view,
+          state->forum_thread_selector,
           state->forum_thread_title,
           state->forum_thread_body,
           state->forum_create_thread,
@@ -2024,6 +2171,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_p
           state->sign_button,
           state->signature_output_view,
           state->receive_view,
+          state->receive_reveal_button,
           state->transactions_view,
           state->hashspec_view,
           state->about_view,
@@ -2054,14 +2202,34 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_p
         SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(ui_font), TRUE);
       }
 
+      set_cue_banner(state->forum_thread_title, L"Thread title");
+      set_cue_banner(state->forum_thread_body, L"Thread markdown");
+      set_cue_banner(state->forum_reply_body, L"Reply markdown");
+      set_cue_banner(state->upload_title, L"Recipe title");
+      set_cue_banner(state->upload_category, L"Category");
+      set_cue_banner(state->upload_body, L"Recipe markdown");
+      set_cue_banner(state->profile_name_edit, L"Display name (immutable)");
+      set_cue_banner(state->profile_cipher_salt_edit, L"Cipher salt");
+      set_cue_banner(state->profile_export_path_edit, L"Backup path");
+      set_cue_banner(state->profile_export_salt_edit, L"Export salt");
+      set_cue_banner(state->profile_import_path_edit, L"Backup path");
+      set_cue_banner(state->send_address_edit, L"SoupNet address (starts with S)");
+      set_cue_banner(state->send_amount_edit, L"Amount (Basil, up to 8 decimals)");
+      set_cue_banner(state->send_memo_edit, L"Memo (optional)");
+      set_cue_banner(state->sign_message_edit, L"Message to sign");
+      set_cue_banner(state->node_peer_edit, L"peer.host:port");
+      set_cue_banner(state->node_community_id_edit, L"community-id");
+      set_cue_banner(state->node_community_name_edit, L"Community name");
+      set_cue_banner(state->settings_recover_path_edit, L"Backup path");
+
       SetMenu(hwnd, make_main_menu());
 
       const alpha::Result init = state->api.init({
           .app_data_dir = "soupnet-data-win",
           .passphrase = "soupnet-dev-passphrase",
           .mode = alpha::AnonymityMode::Tor,
-          .seed_peers = {"seed.got-soup.local:4001", "24.188.147.247:4001"},
-          .seed_peers_mainnet = {"seed.got-soup.local:4001", "24.188.147.247:4001"},
+          .seed_peers = {"24.188.147.247:4001"},
+          .seed_peers_mainnet = {"24.188.147.247:4001"},
           .seed_peers_testnet = {"seed.got-soup.local:14001"},
           .alpha_test_mode = false,
           .peers_dat_path = {},
@@ -2194,6 +2362,11 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_p
         return 0;
       }
 
+      if (command_id == kForumThreadSelectorId && command_code == CBN_SELCHANGE && state != nullptr) {
+        refresh_forum_view(state);
+        return 0;
+      }
+
       if (command_id == kForumCreateThreadId && command_code == BN_CLICKED && state != nullptr) {
         create_forum_thread_from_ui(hwnd, state);
         return 0;
@@ -2205,9 +2378,14 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_p
       }
 
       if (command_id == kUploadSubmitId && command_code == BN_CLICKED && state != nullptr) {
-        const std::string title = wide_to_utf8(read_window_text(state->upload_title));
-        const std::string category = wide_to_utf8(read_window_text(state->upload_category));
-        const std::string body = wide_to_utf8(read_window_text(state->upload_body));
+        const std::string title = trim_copy(wide_to_utf8(read_window_text(state->upload_title)));
+        const std::string category = trim_copy(wide_to_utf8(read_window_text(state->upload_category)));
+        const std::string body = trim_copy(wide_to_utf8(read_window_text(state->upload_body)));
+        if (title.empty() || category.empty() || body.empty()) {
+          MessageBoxW(hwnd, L"Recipe title, category, and markdown are required.", L"Upload Recipe",
+                      MB_OK | MB_ICONWARNING);
+          return 0;
+        }
 
         const alpha::Result result = state->api.create_recipe({
             .category = category,
@@ -2248,6 +2426,11 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_p
 
       if (command_id == kSignButtonId && command_code == BN_CLICKED && state != nullptr) {
         sign_message_from_ui(hwnd, state);
+        return 0;
+      }
+
+      if (command_id == kReceiveRevealButtonId && command_code == BN_CLICKED && state != nullptr) {
+        toggle_receive_private_key(hwnd, state);
         return 0;
       }
 

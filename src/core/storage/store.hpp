@@ -105,7 +105,7 @@ private:
   std::int64_t min_subsidy_units_ = 1;
   std::uint64_t difficulty_adjustment_interval_blocks_ = 864;
   int pow_difficulty_nibbles_ = 4;
-  std::string chain_id_ = "got-soup-mainnet-v1";
+  std::string chain_id_ = "got-soup-mainnet-v3";
   std::string network_id_ = "mainnet";
   std::string genesis_psz_timestamp_;
   std::string hardcoded_genesis_merkle_root_;
@@ -151,6 +151,7 @@ private:
   [[nodiscard]] std::string consensus_hash() const;
   [[nodiscard]] std::string timeline_hash() const;
   [[nodiscard]] std::size_t block_event_bytes(const BlockRecord& block) const;
+  [[nodiscard]] std::optional<BlockRecord> latest_checkpoint_block() const;
   void record_invalid_event(std::string_view event_id, std::string_view reason);
 };
 

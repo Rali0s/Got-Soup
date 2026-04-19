@@ -33,6 +33,7 @@ public:
 
   Result export_identity_backup(std::string_view backup_path, std::string_view password,
                                 std::string_view salt) const;
+  Result verify_identity_backup(std::string_view backup_path, std::string_view password) const;
   Result import_identity_backup(std::string_view backup_path, std::string_view password,
                                 std::string_view local_passphrase);
   Result lock_identity();

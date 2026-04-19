@@ -99,6 +99,13 @@ elseif(APPLE)
   add_executable(alpha_macos
     src/app/main_macos.mm
   )
+  add_executable(alpha_daemon
+    src/daemon/main_daemon.cpp
+  )
+  set_target_properties(alpha_daemon PROPERTIES OUTPUT_NAME "got-soupd")
+  target_include_directories(alpha_daemon PRIVATE src)
+  alpha_apply_compile_flags(alpha_daemon)
+  target_link_libraries(alpha_daemon PRIVATE alpha_core)
   set_target_properties(alpha_macos PROPERTIES OUTPUT_NAME "got-soup")
   target_include_directories(alpha_macos PRIVATE src)
   alpha_apply_compile_flags(alpha_macos)
@@ -113,6 +120,13 @@ elseif(UNIX)
   add_executable(alpha_linux
     src/app/main_linux.cpp
   )
+  add_executable(alpha_daemon
+    src/daemon/main_daemon.cpp
+  )
+  set_target_properties(alpha_daemon PROPERTIES OUTPUT_NAME "got-soupd")
+  target_include_directories(alpha_daemon PRIVATE src)
+  alpha_apply_compile_flags(alpha_daemon)
+  target_link_libraries(alpha_daemon PRIVATE alpha_core)
   set_target_properties(alpha_linux PROPERTIES OUTPUT_NAME "got-soup")
   target_include_directories(alpha_linux PRIVATE src)
   alpha_apply_compile_flags(alpha_linux)

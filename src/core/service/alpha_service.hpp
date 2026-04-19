@@ -39,6 +39,8 @@ struct NodeStatusReport {
 
   std::string peers_dat_path;
   std::vector<std::string> peers;
+  std::string startup_recovery_summary;
+  std::string startup_recovery_path;
 
   CommunityProfile community;
   std::vector<CommunityProfile> known_communities;
@@ -83,13 +85,16 @@ public:
   Result remove_moderator(std::string_view cid);
   Result flag_content(std::string_view object_id, std::string_view reason);
   Result set_content_hidden(std::string_view object_id, bool hidden, std::string_view reason);
+  Result downvote_and_purge_content(std::string_view object_id, std::string_view reason);
   Result pin_core_topic(std::string_view recipe_id, bool pinned);
   Result export_key_backup(std::string_view backup_path, std::string_view password, std::string_view salt);
+  Result verify_key_backup(std::string_view backup_path, std::string_view password);
   Result import_key_backup(std::string_view backup_path, std::string_view password);
   Result lock_wallet();
   Result unlock_wallet(std::string_view passphrase);
   Result recover_wallet(std::string_view backup_path, std::string_view backup_password,
                         std::string_view new_local_passphrase);
+  Result prepare_genesis_reset();
   Result nuke_key(std::string_view confirmation_phrase);
   Result run_backtest_validation();
 
@@ -102,6 +107,7 @@ public:
   [[nodiscard]] std::int64_t local_reward_balance() const;
   [[nodiscard]] std::vector<RewardBalanceSummary> reward_balances() const;
   [[nodiscard]] ReceiveAddressInfo receive_info() const;
+  [[nodiscard]] MiningTemplate mining_template() const;
   [[nodiscard]] std::string hashspec_console() const;
   [[nodiscard]] std::string soup_address() const;
   [[nodiscard]] std::string public_key() const;
@@ -147,7 +153,14 @@ private:
   Result ensure_local_moderator(std::string_view operation) const;
   bool wallet_locked() const;
   Result ensure_wallet_unlocked(std::string_view operation) const;
+  Result ensure_wallet_ready_for_mutation(std::string_view operation) const;
   GenesisSpec active_genesis_spec() const;
+  Result apply_release_reset_if_needed();
+  Result create_fresh_genesis_marker(bool preserve_existing_marker);
+  Result load_fresh_genesis_marker();
+  Result quarantine_legacy_runtime_state(std::string_view reason);
+  Result verify_backup_preflight(std::string_view backup_path, std::string_view password) const;
+  void refresh_backup_state();
   Result load_profile_state();
   Result save_profile_state() const;
   std::unordered_map<std::string, std::string> observed_display_names_by_cid() const;
@@ -167,12 +180,21 @@ private:
   std::string local_display_name_;
   bool wallet_destroyed_ = false;
   bool wallet_recovery_required_ = false;
+  bool wallet_backup_exists_ = false;
+  bool wallet_backup_verified_ = false;
+  bool wallet_backup_required_ = true;
+  bool onboarding_complete_ = false;
   std::string last_key_backup_path_;
+  std::int64_t backup_last_unix_ = 0;
   std::int64_t wallet_last_unlocked_unix_ = 0;
   std::int64_t wallet_last_locked_unix_ = 0;
+  std::int64_t wallet_identity_changed_unix_ = 0;
   std::int64_t last_local_event_unix_ts_ = 0;
   std::uint64_t validation_interval_ticks_ = 10;
   std::uint64_t ticks_since_last_validation_ = 0;
+  std::string startup_recovery_summary_;
+  std::string startup_recovery_path_;
+  std::string fresh_genesis_marker_path_;
 
   CryptoEngine crypto_;
   Store store_;

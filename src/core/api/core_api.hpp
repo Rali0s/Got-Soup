@@ -39,13 +39,16 @@ public:
   Result remove_moderator(std::string_view cid);
   Result flag_content(std::string_view object_id, std::string_view reason);
   Result set_content_hidden(std::string_view object_id, bool hidden, std::string_view reason);
+  Result downvote_and_purge_content(std::string_view object_id, std::string_view reason);
   Result pin_core_topic(std::string_view recipe_id, bool pinned);
   Result export_key_backup(std::string_view backup_path, std::string_view password, std::string_view salt);
+  Result verify_key_backup(std::string_view backup_path, std::string_view password);
   Result import_key_backup(std::string_view backup_path, std::string_view password);
   Result lock_wallet();
   Result unlock_wallet(std::string_view passphrase);
   Result recover_wallet(std::string_view backup_path, std::string_view backup_password,
                         std::string_view new_local_passphrase);
+  Result prepare_genesis_reset();
   Result nuke_key(std::string_view confirmation_phrase);
   Result run_backtest_validation();
 
@@ -62,6 +65,7 @@ public:
   std::vector<RewardBalanceSummary> reward_balances() const;
   std::vector<RewardTransactionSummary> reward_transactions() const;
   ReceiveAddressInfo receive_info() const;
+  MiningTemplate mining_template() const;
   std::string hashspec_console() const;
   std::string soup_address() const;
   std::string public_key() const;

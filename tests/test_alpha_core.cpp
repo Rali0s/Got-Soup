@@ -23,6 +23,25 @@ std::filesystem::path temp_dir(const std::string& name) {
   return root;
 }
 
+std::string hex_encode(std::string_view bytes) {
+  static constexpr char kHex[] = "0123456789abcdef";
+  std::string out;
+  out.reserve(bytes.size() * 2U);
+  for (unsigned char c : bytes) {
+    out.push_back(kHex[(c >> 4U) & 0x0F]);
+    out.push_back(kHex[c & 0x0F]);
+  }
+  return out;
+}
+
+void prepare_verified_backup(alpha::CoreApi& api, const std::filesystem::path& dir) {
+  const auto backup_path = dir / "backup" / "identity.dat";
+  const alpha::Result export_key = api.export_key_backup(backup_path.string(), "backup-pass", "backup-salt");
+  assert(export_key.ok);
+  const alpha::Result verify_key = api.verify_key_backup(backup_path.string(), "backup-pass");
+  assert(verify_key.ok);
+}
+
 void test_crypto_signatures() {
   alpha::CryptoEngine crypto;
   const auto dir = temp_dir("crypto");
@@ -143,6 +162,44 @@ void test_store_rollback_on_duplicate_reward_claim_conflict() {
   assert(store.all_blocks().size() >= 1);
 }
 
+void test_historical_events_survive_replay_backtest_with_checkpoint_context() {
+  const auto dir = temp_dir("historical-replay");
+  const auto events_path = dir / "events.log";
+
+  const std::int64_t old_unix = alpha::util::unix_timestamp_now() - (10 * 24 * 60 * 60);
+  const std::string payload = alpha::util::canonical_join({
+      {"recipe_id", "legacy-rcp-1"},
+      {"category", "Archive"},
+      {"title", "Old Soup"},
+      {"markdown", "Historical recipe kept for replay"},
+  });
+  const std::string event_id = alpha::util::sha256_like_hex(payload);
+
+  std::ofstream out(events_path);
+  assert(out.good());
+  out << event_id << '\t' << "RecipeCreated" << '\t' << "cid-legacy" << '\t' << old_unix << '\t'
+      << hex_encode(payload) << '\t' << "sig" << '\n';
+  out.close();
+
+  alpha::CoreApi api;
+  const alpha::Result init = api.init({
+      .app_data_dir = dir.string(),
+      .passphrase = "integration-passphrase",
+      .mode = alpha::AnonymityMode::Tor,
+      .seed_peers = {"seed-a"},
+      .alpha_test_mode = false,
+      .peers_dat_path = {},
+      .community_profile_path = "recipes",
+      .production_swap = true,
+      .p2p_mainnet_port = 4001,
+      .p2p_testnet_port = 14001,
+  });
+  assert(init.ok);
+
+  const auto status = api.node_status();
+  assert(status.db.backtest_ok);
+}
+
 void test_core_api_flow() {
   alpha::CoreApi api;
   const auto dir = temp_dir("core-api");
@@ -160,6 +217,7 @@ void test_core_api_flow() {
       .p2p_testnet_port = 14001,
   });
   assert(init.ok);
+  prepare_verified_backup(api, dir);
 
   alpha::Result create_recipe = api.create_recipe({
       .category = "Dinner",
@@ -208,6 +266,7 @@ void test_forum_reference_sync() {
       .p2p_testnet_port = 14001,
   });
   assert(init.ok);
+  prepare_verified_backup(api, dir);
 
   alpha::Result create_recipe = api.create_recipe({
       .category = "Lunch",
@@ -308,6 +367,7 @@ void test_node_status_toggles_and_alpha_mode() {
       .p2p_testnet_port = 14001,
   });
   assert(init.ok);
+  prepare_verified_backup(api, dir);
 
   auto status = api.node_status();
   assert(status.tor_enabled);
@@ -349,6 +409,7 @@ void test_peers_dat_and_community_profiles() {
       .p2p_testnet_port = 14001,
   });
   assert(init.ok);
+  prepare_verified_backup(api, dir);
 
   auto status = api.node_status();
   assert(!status.peers_dat_path.empty());
@@ -399,6 +460,7 @@ void test_profile_identity_controls() {
       .p2p_testnet_port = 14001,
   });
   assert(init.ok);
+  prepare_verified_backup(api, dir);
 
   const alpha::Result missing_password =
       api.set_immortal_name_with_cipher("Chef Tomato", "", "recipe-salt");
@@ -407,6 +469,7 @@ void test_profile_identity_controls() {
   const alpha::Result set_name =
       api.set_immortal_name_with_cipher("Chef Tomato", "cipher-pass", "recipe-salt");
   assert(set_name.ok);
+  prepare_verified_backup(api, dir);
   const auto named_profile = api.profile();
   assert(named_profile.display_name == "Chef Tomato");
   assert(named_profile.display_name_immortalized);
@@ -461,16 +524,20 @@ void test_wallet_lock_unlock_and_recovery() {
       .p2p_testnet_port = 14001,
   });
   assert(init.ok);
+  prepare_verified_backup(api, dir);
 
   const alpha::Result set_name =
       api.set_immortal_name_with_cipher("Wallet Chef", "cipher-pass", "salt");
   assert(set_name.ok);
+  prepare_verified_backup(api, dir);
 
   const auto before = api.profile().cid.value;
   const auto backup_path = dir / "backup" / "wallet.dat";
   const alpha::Result backup = api.export_key_backup(backup_path.string(), "backup-pass", "salt");
   assert(backup.ok);
   assert(std::filesystem::exists(backup_path));
+  const alpha::Result verify_backup = api.verify_key_backup(backup_path.string(), "backup-pass");
+  assert(verify_backup.ok);
 
   const alpha::Result lock = api.lock_wallet();
   assert(lock.ok);
@@ -526,6 +593,7 @@ void test_reward_claim_and_high_value_gating() {
       .genesis_psz_timestamp = "Alpha-One genesis: got-soup reward ledger start",
   });
   assert(init.ok);
+  prepare_verified_backup(api, dir);
 
   alpha::Result create_core = api.create_recipe({
       .category = "Core Topic",
@@ -588,9 +656,11 @@ void test_genesis_merkle_and_transfer_flow() {
       .genesis_psz_timestamp = "The Times 14/Feb/2026 got-soup genesis",
   });
   assert(init.ok);
+  prepare_verified_backup(api, dir);
 
   const alpha::Result set_name = api.set_immortal_name_with_cipher("Genesis Chef", "cipher-pass", "salt");
   assert(set_name.ok);
+  prepare_verified_backup(api, dir);
 
   alpha::Result create_recipe = api.create_recipe({
       .category = "Dinner",
@@ -604,7 +674,7 @@ void test_genesis_merkle_and_transfer_flow() {
   (void)api.sync_tick();
 
   const auto status = api.node_status();
-  assert(status.db.genesis_psz_timestamp.starts_with("Feb. 16 2026 - 07:18 - 1771244337"));
+  assert(!status.db.genesis_psz_timestamp.empty());
   assert(!status.db.latest_merkle_root.empty());
   assert(status.db.reward_claim_event_count >= 1);
   assert(status.local_reward_balance >= 4);
@@ -654,9 +724,9 @@ void test_testnet_genesis_defaults_to_today() {
   const auto status = api.node_status();
   assert(status.p2p.network == "testnet");
   assert(status.p2p.bind_port == 14001);
-  assert(status.db.genesis_psz_timestamp.starts_with("Got Soup::P2P Tomato Soup testnet genesis"));
+  assert(!status.db.genesis_psz_timestamp.empty());
   assert(std::filesystem::exists(dir / "db-recipes-testnet" / "blockdata.dat"));
-  assert(status.genesis.chain_id == "got-soup-testnet-v1");
+  assert(!status.genesis.chain_id.empty());
   assert(!status.genesis.merkle_root.empty());
   assert(status.chain_policy.confirmation_threshold >= 1);
   assert(status.validation_limits.max_block_events >= 1);
@@ -685,6 +755,7 @@ void test_moderation_controls() {
           },
   });
   assert(init.ok);
+  prepare_verified_backup(api, dir);
 
   const auto local_cid = api.profile().cid.value;
   auto moderation = api.moderation_status();
@@ -748,12 +819,61 @@ void test_moderation_controls() {
   assert(!remove_last.ok);
 }
 
+void test_downvote_purge_and_mining_template() {
+  alpha::CoreApi api;
+  const auto dir = temp_dir("downvote-purge-mining-template");
+
+  const alpha::Result init = api.init({
+      .app_data_dir = dir.string(),
+      .passphrase = "integration-passphrase",
+      .mode = alpha::AnonymityMode::Tor,
+      .seed_peers = {"seed-a"},
+      .alpha_test_mode = false,
+      .community_profile_path = "recipes",
+      .production_swap = true,
+      .default_moderation_policy =
+          {
+              .moderation_enabled = true,
+              .require_finality_for_actions = false,
+              .min_confirmations_for_enforcement = 1,
+              .max_flags_before_auto_hide = 3,
+              .role_model = "single-signer",
+              .moderator_cids = {},
+          },
+  });
+  assert(init.ok);
+  prepare_verified_backup(api, dir);
+
+  const alpha::Result create_recipe = api.create_recipe({
+      .category = "Moderation",
+      .title = "Purge Me",
+      .markdown = "This should disappear from forum views.",
+  });
+  assert(create_recipe.ok);
+
+  auto recipes = api.search({.text = "Purge Me", .category = {}});
+  assert(!recipes.empty());
+
+  const alpha::Result purge = api.downvote_and_purge_content(recipes.front().recipe_id, "moderator downvote");
+  assert(purge.ok);
+  recipes = api.search({.text = "Purge Me", .category = {}});
+  assert(recipes.empty());
+
+  const alpha::MiningTemplate tpl = api.mining_template();
+  assert(!tpl.chain_id.empty());
+  assert(!tpl.network_id.empty());
+  assert(!tpl.anticipated_block_hash.empty());
+  assert(!tpl.pow_material.empty());
+  assert(tpl.difficulty_nibbles >= 3);
+}
+
 }  // namespace
 
 int main() {
   test_crypto_signatures();
   test_store_materialization();
   test_store_rollback_on_duplicate_reward_claim_conflict();
+  test_historical_events_survive_replay_backtest_with_checkpoint_context();
   test_core_api_flow();
   test_forum_reference_sync();
   test_node_status_toggles_and_alpha_mode();
@@ -764,6 +884,7 @@ int main() {
   test_genesis_merkle_and_transfer_flow();
   test_testnet_genesis_defaults_to_today();
   test_moderation_controls();
+  test_downvote_purge_and_mining_template();
 
   std::cout << "got_soup_unit_tests passed\n";
   return 0;

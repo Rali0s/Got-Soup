@@ -154,12 +154,56 @@ bool is_png_file(const std::filesystem::path& path) {
   return ext == ".png";
 }
 
+std::unordered_map<std::string, std::string> parse_key_values_file(std::string_view text) {
+  std::unordered_map<std::string, std::string> fields;
+  std::istringstream in(std::string{text});
+  std::string line;
+  while (std::getline(in, line)) {
+    const std::string trimmed = util::trim_copy(line);
+    if (trimmed.empty() || trimmed.front() == '#') {
+      continue;
+    }
+    const auto split = trimmed.find('=');
+    if (split == std::string::npos) {
+      continue;
+    }
+    fields[util::trim_copy(trimmed.substr(0, split))] = util::trim_copy(trimmed.substr(split + 1));
+  }
+  return fields;
+}
+
+bool write_key_values_file(const std::filesystem::path& path,
+                           const std::vector<std::pair<std::string, std::string>>& fields) {
+  std::error_code ec;
+  if (path.has_parent_path()) {
+    std::filesystem::create_directories(path.parent_path(), ec);
+    if (ec) {
+      return false;
+    }
+  }
+  std::ofstream out(path, std::ios::out | std::ios::trunc);
+  if (!out) {
+    return false;
+  }
+  for (const auto& [key, value] : fields) {
+    out << key << "=" << value << '\n';
+  }
+  return out.good();
+}
+
 bool should_rebuild_local_store(std::string_view message) {
   return message.find("Chain ID mismatch") != std::string_view::npos ||
          message.find("Network ID mismatch") != std::string_view::npos ||
          message.find("Community mismatch") != std::string_view::npos ||
          message.find("Failed to parse") != std::string_view::npos ||
-         message.find("Event ID mismatch") != std::string_view::npos;
+         message.find("Event ID mismatch") != std::string_view::npos ||
+         message.find("Event timestamp exceeds future drift") != std::string_view::npos ||
+         message.find("Block references missing event") != std::string_view::npos ||
+         message.find("Merkle root mismatch") != std::string_view::npos ||
+         message.find("Content hash mismatch") != std::string_view::npos ||
+         message.find("Block hash mismatch") != std::string_view::npos ||
+         message.find("Duplicate event assignment in blocks") != std::string_view::npos ||
+         message.find("Event not assigned to any block") != std::string_view::npos;
 }
 
 bool has_duplicate_reward_claim_error(std::string_view message) {
@@ -199,6 +243,10 @@ Result quarantine_and_reset_store_dir(std::string_view app_data_dir, std::string
   }
 
   return Result::success("Local store reset: " + std::string{reason});
+}
+
+std::string make_reset_seed(std::int64_t reset_unix) {
+  return std::to_string(reset_unix) + "|" + std::string{alpha::kAppVersion};
 }
 
 std::optional<std::filesystem::path> find_named_asset_upwards(std::string_view filename, std::size_t max_levels) {
@@ -443,6 +491,12 @@ Result AlphaService::init(const InitConfig& config) {
     return Result::failure("Init failed: unable to create assets dir: " + ec.message());
   }
   seed_default_assets(config_.app_data_dir);
+  fresh_genesis_marker_path_ =
+      (std::filesystem::path{config_.app_data_dir} / "fresh-genesis.state").string();
+  const Result release_reset = apply_release_reset_if_needed();
+  if (!release_reset.ok) {
+    return release_reset;
+  }
 
   const Result crypto_init =
       crypto_.initialize(config_.app_data_dir, config_.passphrase, config_.production_swap);
@@ -471,7 +525,7 @@ Result AlphaService::init(const InitConfig& config) {
     config_.seed_peers_testnet = config_.seed_peers_mainnet;
   }
   if (config_.seed_peers_mainnet.empty()) {
-    config_.seed_peers_mainnet = {"seed.got-soup.local:4001", "24.188.147.247:4001"};
+    config_.seed_peers_mainnet = {"24.188.147.247:4001"};
   }
   if (config_.seed_peers_testnet.empty()) {
     config_.seed_peers_testnet = {"seed.got-soup.local:14001"};
@@ -490,6 +544,8 @@ Result AlphaService::init(const InitConfig& config) {
   wallet_recovery_required_ = false;
   wallet_last_unlocked_unix_ = crypto_.last_unlocked_unix();
   wallet_last_locked_unix_ = crypto_.last_locked_unix();
+  wallet_identity_changed_unix_ = std::max<std::int64_t>(wallet_identity_changed_unix_, wallet_last_unlocked_unix_);
+  refresh_backup_state();
 
   store_.set_block_timing(config_.block_interval_seconds == 0 ? 150 : config_.block_interval_seconds);
   store_.set_block_reward_units(config_.block_reward_units <= 0 ? 115 : config_.block_reward_units);
@@ -528,15 +584,184 @@ Result AlphaService::init(const InitConfig& config) {
 
   const Result initial_backtest = run_backtest_validation();
   if (!initial_backtest.ok) {
-    return initial_backtest;
+    const Result rollback = store_.rollback_to_last_checkpoint("startup validation failure");
+    if (rollback.ok) {
+      const Result recovered_backtest = run_backtest_validation();
+      if (recovered_backtest.ok) {
+        initialized_ = true;
+        return Result::success("SoupNet service initialized after recovering to the last checkpoint.",
+                               rollback.message + "\n" + recovered_backtest.message);
+      }
+      return Result::failure(initial_backtest.message + "\n\nRecovery attempted:\n" + rollback.message +
+                             "\n\nValidation after recovery still failed:\n" + recovered_backtest.message);
+    }
+    return Result::failure(initial_backtest.message + "\n\nRecovery unavailable:\n" + rollback.message);
   }
 
   initialized_ = true;
   return Result::success("SoupNet service initialized with node status controls, peers.dat and community profiles.");
 }
 
+Result AlphaService::create_fresh_genesis_marker(bool preserve_existing_marker) {
+  const std::filesystem::path marker_path{fresh_genesis_marker_path_};
+  if (preserve_existing_marker && std::filesystem::exists(marker_path)) {
+    return Result::success("Fresh genesis marker already present.", marker_path.string());
+  }
+
+  const std::int64_t reset_unix = util::unix_timestamp_now();
+  const std::string seed = make_reset_seed(reset_unix);
+  const std::string suffix = util::sha256_like_hex(seed).substr(0, 12);
+  const std::string mainnet_chain_id = "got-soup-mainnet-v3";
+  const std::string testnet_chain_id = "got-soup-testnet-v3-" + suffix;
+  const std::string mainnet_psz =
+      "Apr 14, 2026, 5:08 AM ET//Anthropic discussing its powerful AI model Mythos with US: report//"
+      "https://seekingalpha.com/news/4574628-anthropic-discussing-its-powerful-ai-model-mythos-with-us";
+  const std::string testnet_psz =
+      "Got-Soup fresh genesis reset | " + std::to_string(reset_unix) + " | testnet | " + suffix;
+  const std::string mainnet_merkle = "3841f540d53967b51a1eab6bfd50be5feb0cab2323fd7c1bda44795c400352fd";
+  const std::string testnet_merkle = util::sha256_like_hex(testnet_chain_id + "|" + testnet_psz);
+  const std::string mainnet_block_hash = "20d14caaebca64e012c09fdacbbe2fcfb1def9fe083512591879dce30f090cbf";
+  const std::string testnet_block_hash = util::sha256_like_hex(testnet_merkle + "|block");
+
+  const bool wrote = write_key_values_file(
+      marker_path,
+      {{"release_tag", config_.fresh_genesis_release_tag},
+       {"reset_unix", std::to_string(reset_unix)},
+       {"mainnet_chain_id", mainnet_chain_id},
+       {"testnet_chain_id", testnet_chain_id},
+       {"mainnet_psz", mainnet_psz},
+       {"testnet_psz", testnet_psz},
+       {"mainnet_merkle_root", mainnet_merkle},
+       {"testnet_merkle_root", testnet_merkle},
+       {"mainnet_block_hash", mainnet_block_hash},
+       {"testnet_block_hash", testnet_block_hash}});
+  if (!wrote) {
+    return Result::failure("Unable to write fresh genesis marker.");
+  }
+
+  return Result::success("Fresh genesis marker created.", marker_path.string());
+}
+
+Result AlphaService::load_fresh_genesis_marker() {
+  const std::filesystem::path marker_path{fresh_genesis_marker_path_};
+  std::ifstream in(marker_path);
+  if (!in) {
+    return Result::failure("Fresh genesis marker is missing.");
+  }
+  std::ostringstream buffer;
+  buffer << in.rdbuf();
+  const auto fields = parse_key_values_file(buffer.str());
+  if (!fields.contains("mainnet_chain_id") || !fields.contains("testnet_chain_id") ||
+      !fields.contains("mainnet_psz") || !fields.contains("testnet_psz") ||
+      !fields.contains("mainnet_merkle_root") || !fields.contains("testnet_merkle_root") ||
+      !fields.contains("mainnet_block_hash") || !fields.contains("testnet_block_hash")) {
+    return Result::failure("Fresh genesis marker is incomplete.");
+  }
+
+  config_.mainnet_chain_id = fields.at("mainnet_chain_id");
+  config_.testnet_chain_id = fields.at("testnet_chain_id");
+  config_.mainnet_genesis_psz_timestamp = fields.at("mainnet_psz");
+  config_.testnet_genesis_psz_timestamp = fields.at("testnet_psz");
+  config_.mainnet_genesis_merkle_root = fields.at("mainnet_merkle_root");
+  config_.testnet_genesis_merkle_root = fields.at("testnet_merkle_root");
+  config_.mainnet_genesis_block_hash = fields.at("mainnet_block_hash");
+  config_.testnet_genesis_block_hash = fields.at("testnet_block_hash");
+  return Result::success("Fresh genesis marker loaded.", marker_path.string());
+}
+
+Result AlphaService::quarantine_legacy_runtime_state(std::string_view reason) {
+  std::error_code ec;
+  const std::filesystem::path root{config_.app_data_dir};
+  const std::filesystem::path recovery_root = root / "recovery";
+  std::filesystem::create_directories(recovery_root, ec);
+  if (ec) {
+    return Result::failure("Unable to create recovery directory: " + ec.message());
+  }
+
+  const std::filesystem::path quarantine_dir =
+      recovery_root / ("fresh-genesis-quarantine-" + std::to_string(util::unix_timestamp_now()));
+  std::filesystem::create_directories(quarantine_dir, ec);
+  if (ec) {
+    return Result::failure("Unable to create quarantine directory: " + ec.message());
+  }
+
+  bool moved_any = false;
+  for (const auto& entry : std::filesystem::directory_iterator(root, ec)) {
+    if (ec) {
+      return Result::failure("Unable to scan app data directory: " + ec.message());
+    }
+    const std::string name = entry.path().filename().string();
+    if (name == "assets" || name == "backup" || name == "recovery" || name == "ui_mode.cfg" ||
+        name == "fresh-genesis.state" || name == "fresh-genesis.release") {
+      continue;
+    }
+    if (!entry.is_directory(ec) && !entry.is_regular_file(ec)) {
+      ec.clear();
+      continue;
+    }
+    const bool is_store_dir = entry.is_directory(ec) && name.starts_with("db-");
+    const bool is_runtime_file =
+        entry.is_regular_file(ec) &&
+        (name == "identity.vault" || name == "profile-state.dat" || name.starts_with("peers-") ||
+         name.ends_with(".dat"));
+    const bool is_communities_dir = entry.is_directory(ec) && name == "communities";
+    if (!is_store_dir && !is_runtime_file && !is_communities_dir) {
+      ec.clear();
+      continue;
+    }
+
+    const std::filesystem::path target = quarantine_dir / name;
+    std::filesystem::rename(entry.path(), target, ec);
+    if (ec) {
+      return Result::failure("Unable to quarantine legacy runtime state: " + ec.message());
+    }
+    moved_any = true;
+  }
+
+  if (moved_any) {
+    startup_recovery_summary_ = "Fresh genesis reset quarantined legacy runtime state. " + std::string{reason};
+    startup_recovery_path_ = quarantine_dir.string();
+    return Result::success("Legacy runtime state quarantined.", quarantine_dir.string());
+  }
+
+  startup_recovery_summary_.clear();
+  startup_recovery_path_.clear();
+  return Result::success("No legacy runtime state required quarantine.", quarantine_dir.string());
+}
+
+Result AlphaService::apply_release_reset_if_needed() {
+  const std::filesystem::path release_path =
+      std::filesystem::path{config_.app_data_dir} / "fresh-genesis.release";
+  std::string release_tag;
+  std::ifstream release_in(release_path);
+  if (release_in) {
+    std::ostringstream buffer;
+    buffer << release_in.rdbuf();
+    const auto fields = parse_key_values_file(buffer.str());
+    if (fields.contains("release_tag")) {
+      release_tag = fields.at("release_tag");
+    }
+  }
+
+  if (release_tag != config_.fresh_genesis_release_tag) {
+    const Result marker = create_fresh_genesis_marker(false);
+    if (!marker.ok) {
+      return marker;
+    }
+    const Result quarantine = quarantine_legacy_runtime_state("release tag " + config_.fresh_genesis_release_tag);
+    if (!quarantine.ok) {
+      return quarantine;
+    }
+    if (!write_key_values_file(release_path, {{"release_tag", config_.fresh_genesis_release_tag}})) {
+      return Result::failure("Unable to persist fresh genesis release marker.");
+    }
+  }
+
+  return load_fresh_genesis_marker();
+}
+
 Result AlphaService::create_recipe(const RecipeDraft& draft) {
-  if (const Result unlocked = ensure_wallet_unlocked("create_recipe"); !unlocked.ok) {
+  if (const Result unlocked = ensure_wallet_ready_for_mutation("create_recipe"); !unlocked.ok) {
     return unlocked;
   }
   if (draft.title.empty()) {
@@ -586,7 +811,7 @@ Result AlphaService::create_recipe(const RecipeDraft& draft) {
 }
 
 Result AlphaService::create_thread(const ThreadDraft& draft) {
-  if (const Result unlocked = ensure_wallet_unlocked("create_thread"); !unlocked.ok) {
+  if (const Result unlocked = ensure_wallet_ready_for_mutation("create_thread"); !unlocked.ok) {
     return unlocked;
   }
   if (draft.recipe_id.empty()) {
@@ -621,7 +846,7 @@ Result AlphaService::create_thread(const ThreadDraft& draft) {
 }
 
 Result AlphaService::create_reply(const ReplyDraft& draft) {
-  if (const Result unlocked = ensure_wallet_unlocked("create_reply"); !unlocked.ok) {
+  if (const Result unlocked = ensure_wallet_ready_for_mutation("create_reply"); !unlocked.ok) {
     return unlocked;
   }
   if (draft.thread_id.empty()) {
@@ -655,7 +880,7 @@ Result AlphaService::create_reply(const ReplyDraft& draft) {
 }
 
 Result AlphaService::add_review(const ReviewDraft& draft) {
-  if (const Result unlocked = ensure_wallet_unlocked("add_review"); !unlocked.ok) {
+  if (const Result unlocked = ensure_wallet_ready_for_mutation("add_review"); !unlocked.ok) {
     return unlocked;
   }
   if (draft.recipe_id.empty()) {
@@ -689,7 +914,7 @@ Result AlphaService::add_review(const ReviewDraft& draft) {
 }
 
 Result AlphaService::add_thumb_up(std::string_view recipe_id) {
-  if (const Result unlocked = ensure_wallet_unlocked("add_thumb_up"); !unlocked.ok) {
+  if (const Result unlocked = ensure_wallet_ready_for_mutation("add_thumb_up"); !unlocked.ok) {
     return unlocked;
   }
   const std::string target{recipe_id};
@@ -720,7 +945,7 @@ Result AlphaService::add_thumb_up(std::string_view recipe_id) {
 }
 
 Result AlphaService::transfer_rewards(const RewardTransferDraft& draft) {
-  if (const Result unlocked = ensure_wallet_unlocked("transfer_rewards"); !unlocked.ok) {
+  if (const Result unlocked = ensure_wallet_ready_for_mutation("transfer_rewards"); !unlocked.ok) {
     return unlocked;
   }
   const std::string target_name = sanitize_display_name(draft.to_display_name);
@@ -768,7 +993,7 @@ Result AlphaService::transfer_rewards(const RewardTransferDraft& draft) {
 }
 
 Result AlphaService::transfer_rewards_to_address(const RewardTransferAddressDraft& draft) {
-  if (const Result unlocked = ensure_wallet_unlocked("transfer_rewards_to_address"); !unlocked.ok) {
+  if (const Result unlocked = ensure_wallet_ready_for_mutation("transfer_rewards_to_address"); !unlocked.ok) {
     return unlocked;
   }
   const std::string target_address = util::trim_copy(draft.to_address);
@@ -1011,7 +1236,7 @@ Result AlphaService::reload_peers_dat() {
 }
 
 Result AlphaService::set_profile_display_name(std::string_view display_name) {
-  if (const Result unlocked = ensure_wallet_unlocked("set_profile_display_name"); !unlocked.ok) {
+  if (const Result unlocked = ensure_wallet_ready_for_mutation("set_profile_display_name"); !unlocked.ok) {
     return unlocked;
   }
   const std::string sanitized = sanitize_display_name(display_name);
@@ -1057,7 +1282,7 @@ Result AlphaService::set_profile_display_name(std::string_view display_name) {
 Result AlphaService::set_immortal_name_with_cipher(std::string_view display_name,
                                                    std::string_view cipher_password,
                                                    std::string_view cipher_salt) {
-  if (const Result unlocked = ensure_wallet_unlocked("set_immortal_name_with_cipher"); !unlocked.ok) {
+  if (const Result unlocked = ensure_wallet_ready_for_mutation("set_immortal_name_with_cipher"); !unlocked.ok) {
     return unlocked;
   }
   const std::string pass = util::trim_copy(cipher_password);
@@ -1084,7 +1309,7 @@ Result AlphaService::set_immortal_name_with_cipher(std::string_view display_name
 }
 
 Result AlphaService::set_duplicate_name_policy(bool reject_duplicates) {
-  if (const Result unlocked = ensure_wallet_unlocked("set_duplicate_name_policy"); !unlocked.ok) {
+  if (const Result unlocked = ensure_wallet_ready_for_mutation("set_duplicate_name_policy"); !unlocked.ok) {
     return unlocked;
   }
   reject_duplicate_names_ = reject_duplicates;
@@ -1106,7 +1331,7 @@ Result AlphaService::set_duplicate_name_policy(bool reject_duplicates) {
 }
 
 Result AlphaService::set_profile_cipher_password(std::string_view password, std::string_view salt) {
-  if (const Result unlocked = ensure_wallet_unlocked("set_profile_cipher_password"); !unlocked.ok) {
+  if (const Result unlocked = ensure_wallet_ready_for_mutation("set_profile_cipher_password"); !unlocked.ok) {
     return unlocked;
   }
   const std::string pass = util::trim_copy(password);
@@ -1129,7 +1354,7 @@ Result AlphaService::set_profile_cipher_password(std::string_view password, std:
 }
 
 Result AlphaService::update_key_to_peers() {
-  if (const Result unlocked = ensure_wallet_unlocked("update_key_to_peers"); !unlocked.ok) {
+  if (const Result unlocked = ensure_wallet_ready_for_mutation("update_key_to_peers"); !unlocked.ok) {
     return unlocked;
   }
   EventEnvelope event = make_event(EventKind::KeyRotated,
@@ -1140,7 +1365,7 @@ Result AlphaService::update_key_to_peers() {
 }
 
 Result AlphaService::add_moderator(std::string_view cid) {
-  if (const Result unlocked = ensure_wallet_unlocked("add_moderator"); !unlocked.ok) {
+  if (const Result unlocked = ensure_wallet_ready_for_mutation("add_moderator"); !unlocked.ok) {
     return unlocked;
   }
   if (const Result auth = ensure_local_moderator("add_moderator"); !auth.ok) {
@@ -1159,7 +1384,7 @@ Result AlphaService::add_moderator(std::string_view cid) {
 }
 
 Result AlphaService::remove_moderator(std::string_view cid) {
-  if (const Result unlocked = ensure_wallet_unlocked("remove_moderator"); !unlocked.ok) {
+  if (const Result unlocked = ensure_wallet_ready_for_mutation("remove_moderator"); !unlocked.ok) {
     return unlocked;
   }
   if (const Result auth = ensure_local_moderator("remove_moderator"); !auth.ok) {
@@ -1178,7 +1403,7 @@ Result AlphaService::remove_moderator(std::string_view cid) {
 }
 
 Result AlphaService::flag_content(std::string_view object_id, std::string_view reason) {
-  if (const Result unlocked = ensure_wallet_unlocked("flag_content"); !unlocked.ok) {
+  if (const Result unlocked = ensure_wallet_ready_for_mutation("flag_content"); !unlocked.ok) {
     return unlocked;
   }
   const std::string target_id = util::trim_copy(object_id);
@@ -1194,7 +1419,7 @@ Result AlphaService::flag_content(std::string_view object_id, std::string_view r
 }
 
 Result AlphaService::set_content_hidden(std::string_view object_id, bool hidden, std::string_view reason) {
-  if (const Result unlocked = ensure_wallet_unlocked("set_content_hidden"); !unlocked.ok) {
+  if (const Result unlocked = ensure_wallet_ready_for_mutation("set_content_hidden"); !unlocked.ok) {
     return unlocked;
   }
   if (const Result auth = ensure_local_moderator("set_content_hidden"); !auth.ok) {
@@ -1214,8 +1439,27 @@ Result AlphaService::set_content_hidden(std::string_view object_id, bool hidden,
   return append_locally_and_queue(event);
 }
 
+Result AlphaService::downvote_and_purge_content(std::string_view object_id, std::string_view reason) {
+  if (const Result auth = ensure_local_moderator("downvote_and_purge_content"); !auth.ok) {
+    return auth;
+  }
+  const std::string target_id = util::trim_copy(object_id);
+  if (target_id.empty()) {
+    return Result::failure("Downvote purge requires an object_id.");
+  }
+  const std::string reason_text = util::trim_copy(reason);
+  const std::string applied_reason =
+      reason_text.empty() ? "downvoted and purged from forum views" : reason_text;
+
+  const Result flagged = flag_content(target_id, applied_reason);
+  if (!flagged.ok) {
+    return flagged;
+  }
+  return set_content_hidden(target_id, true, applied_reason);
+}
+
 Result AlphaService::pin_core_topic(std::string_view recipe_id, bool pinned) {
-  if (const Result unlocked = ensure_wallet_unlocked("pin_core_topic"); !unlocked.ok) {
+  if (const Result unlocked = ensure_wallet_ready_for_mutation("pin_core_topic"); !unlocked.ok) {
     return unlocked;
   }
   if (const Result auth = ensure_local_moderator("pin_core_topic"); !auth.ok) {
@@ -1241,13 +1485,39 @@ Result AlphaService::export_key_backup(std::string_view backup_path, std::string
   const Result result = crypto_.export_identity_backup(resolved, password, salt);
   if (result.ok) {
     last_key_backup_path_ = resolved;
+    backup_last_unix_ = util::unix_timestamp_now();
+    wallet_backup_exists_ = true;
+    wallet_backup_verified_ = false;
+    refresh_backup_state();
     (void)save_profile_state();
   }
   return result;
 }
 
+Result AlphaService::verify_key_backup(std::string_view backup_path, std::string_view password) {
+  const std::string resolved =
+      resolve_data_path(backup_path.empty() ? last_key_backup_path_ : std::string{backup_path},
+                        "backup/identity-backup.dat");
+  const Result verified = verify_backup_preflight(resolved, password);
+  if (!verified.ok) {
+    return verified;
+  }
+  last_key_backup_path_ = resolved;
+  wallet_backup_exists_ = true;
+  wallet_backup_verified_ = true;
+  if (backup_last_unix_ <= 0) {
+    backup_last_unix_ = util::unix_timestamp_now();
+  }
+  refresh_backup_state();
+  (void)save_profile_state();
+  return Result::success("Key backup verified.", verified.data);
+}
+
 Result AlphaService::import_key_backup(std::string_view backup_path, std::string_view password) {
   const std::string resolved = resolve_data_path(backup_path, "backup/identity-backup.dat");
+  if (const Result preflight = verify_backup_preflight(resolved, password); !preflight.ok) {
+    return preflight;
+  }
   const std::string previous_cid = crypto_.identity().cid.value;
   const Result imported = crypto_.import_identity_backup(resolved, password, config_.passphrase);
   if (!imported.ok) {
@@ -1260,7 +1530,12 @@ Result AlphaService::import_key_backup(std::string_view backup_path, std::string
   wallet_recovery_required_ = false;
   wallet_last_unlocked_unix_ = crypto_.last_unlocked_unix();
   wallet_last_locked_unix_ = crypto_.last_locked_unix();
+  wallet_identity_changed_unix_ = wallet_last_unlocked_unix_;
   last_key_backup_path_ = resolved;
+  wallet_backup_exists_ = true;
+  wallet_backup_verified_ = true;
+  backup_last_unix_ = util::unix_timestamp_now();
+  refresh_backup_state();
   const Result save_state = save_profile_state();
   if (!save_state.ok) {
     return save_state;
@@ -1285,6 +1560,7 @@ Result AlphaService::lock_wallet() {
   }
   wallet_last_locked_unix_ = crypto_.last_locked_unix();
   wallet_recovery_required_ = false;
+  refresh_backup_state();
   (void)save_profile_state();
   return Result::success("Wallet locked.");
 }
@@ -1298,6 +1574,7 @@ Result AlphaService::unlock_wallet(std::string_view passphrase) {
   wallet_last_unlocked_unix_ = crypto_.last_unlocked_unix();
   wallet_recovery_required_ = false;
   wallet_destroyed_ = false;
+  refresh_backup_state();
   (void)save_profile_state();
   return restart_network();
 }
@@ -1311,6 +1588,10 @@ Result AlphaService::recover_wallet(std::string_view backup_path, std::string_vi
 
   config_.passphrase = local_pass;
   const std::string resolved = resolve_data_path(backup_path, "backup/identity-backup.dat");
+  if (const Result preflight = verify_backup_preflight(resolved, backup_password); !preflight.ok) {
+    wallet_recovery_required_ = true;
+    return preflight;
+  }
   const Result imported = crypto_.import_identity_backup(resolved, backup_password, config_.passphrase);
   if (!imported.ok) {
     wallet_recovery_required_ = true;
@@ -1320,9 +1601,33 @@ Result AlphaService::recover_wallet(std::string_view backup_path, std::string_vi
   wallet_recovery_required_ = false;
   wallet_destroyed_ = false;
   wallet_last_unlocked_unix_ = crypto_.last_unlocked_unix();
+  wallet_identity_changed_unix_ = wallet_last_unlocked_unix_;
   last_key_backup_path_ = resolved;
+  wallet_backup_exists_ = true;
+  wallet_backup_verified_ = true;
+  backup_last_unix_ = util::unix_timestamp_now();
+  refresh_backup_state();
   (void)save_profile_state();
   return restart_network();
+}
+
+Result AlphaService::prepare_genesis_reset() {
+  const Result marker = create_fresh_genesis_marker(false);
+  if (!marker.ok) {
+    return marker;
+  }
+  const Result quarantine = quarantine_legacy_runtime_state("manual reset request");
+  if (!quarantine.ok) {
+    return quarantine;
+  }
+  const bool wrote =
+      write_key_values_file(std::filesystem::path{config_.app_data_dir} / "fresh-genesis.release",
+                            {{"release_tag", config_.fresh_genesis_release_tag}});
+  if (!wrote) {
+    return Result::failure("Fresh genesis reset prepared, but release marker could not be persisted.");
+  }
+  return Result::success("Fresh genesis reset prepared. Restart the app to create a new chain and identity.",
+                         startup_recovery_path_);
 }
 
 Result AlphaService::nuke_key(std::string_view confirmation_phrase) {
@@ -1343,6 +1648,9 @@ Result AlphaService::nuke_key(std::string_view confirmation_phrase) {
   wallet_recovery_required_ = true;
   wallet_last_unlocked_unix_ = crypto_.last_unlocked_unix();
   wallet_last_locked_unix_ = crypto_.last_locked_unix();
+  wallet_identity_changed_unix_ = wallet_last_unlocked_unix_;
+  wallet_backup_verified_ = false;
+  refresh_backup_state();
   const Result save_state = save_profile_state();
   if (!save_state.ok) {
     return save_state;
@@ -1638,13 +1946,21 @@ NodeStatusReport AlphaService::node_status() const {
       .locked = wallet_locked(),
       .destroyed = wallet_destroyed_,
       .recovery_required = wallet_recovery_required_,
+      .backup_exists = wallet_backup_exists_,
+      .backup_verified = wallet_backup_verified_,
+      .backup_required = wallet_backup_required_,
+      .onboarding_complete = onboarding_complete_,
       .vault_path = crypto_.vault_path(),
       .backup_last_path = last_key_backup_path_,
+      .crypto_mode = crypto_.production_mode_active() ? "production" : "compatibility",
+      .backup_last_unix = backup_last_unix_,
       .last_unlocked_unix = wallet_last_unlocked_unix_,
       .last_locked_unix = wallet_last_locked_unix_,
   };
   report.peers_dat_path = peers_dat_path_;
   report.peers = p2p_node_.peers();
+  report.startup_recovery_summary = startup_recovery_summary_;
+  report.startup_recovery_path = startup_recovery_path_;
   report.community = current_community_;
   report.known_communities = community_profiles();
   report.core_phase_status = crypto_.core_phase_status();
@@ -1672,80 +1988,76 @@ ReceiveAddressInfo AlphaService::receive_info() const {
   info.display_name = local_display_name_;
   info.address = soup_address_from_cid(info.cid);
   info.public_key = crypto_.identity().public_key;
-  info.private_key = crypto_.identity().private_key;
   return info;
+}
+
+MiningTemplate AlphaService::mining_template() const {
+  MiningTemplate tpl;
+  const auto& blocks = store_.all_blocks();
+  if (blocks.empty()) {
+    tpl.chain_id = current_community_.community_id;
+    tpl.network_id = should_use_testnet(alpha_test_mode_, active_mode_) ? "testnet" : "mainnet";
+    tpl.community_id = current_community_.community_id;
+    tpl.miner_cid = crypto_.identity().cid.value;
+    return tpl;
+  }
+
+  const auto& latest = blocks.back();
+  const bool testnet = should_use_testnet(alpha_test_mode_, active_mode_);
+  tpl.chain_id = testnet ? config_.testnet_chain_id : config_.mainnet_chain_id;
+  tpl.network_id = testnet ? "testnet" : "mainnet";
+  tpl.community_id = current_community_.community_id;
+  tpl.miner_cid = crypto_.identity().cid.value;
+  tpl.next_block_index = latest.index + 1U;
+  tpl.next_open_unix = latest.opened_unix + static_cast<std::int64_t>(config_.block_interval_seconds);
+  tpl.prev_hash = latest.block_hash.empty() ? "genesis" : latest.block_hash;
+  tpl.provisional_event_count = 0;
+  tpl.merkle_root = preview_merkle_root({});
+  tpl.content_hash = util::sha256_like_hex("");
+  std::ostringstream block_input;
+  block_input << tpl.next_block_index << "|" << tpl.next_open_unix << "|" << 1 << "|" << 0 << "|" << 0 << "|"
+              << tpl.prev_hash << "|" << tpl.merkle_root << "|" << tpl.content_hash << "|";
+  tpl.anticipated_block_hash = util::sha256_like_hex(block_input.str());
+  tpl.difficulty_nibbles = testnet ? 3 : 4;
+  tpl.pow_material = tpl.community_id + "|" + tpl.miner_cid + "|" + std::to_string(tpl.next_block_index) + "|" +
+                     tpl.anticipated_block_hash + "|" + tpl.merkle_root;
+  tpl.sample_nonce_hash = util::sha256_like_hex(tpl.pow_material + "|0");
+  return tpl;
 }
 
 std::string AlphaService::hashspec_console() const {
   const auto& blocks = store_.all_blocks();
-  const auto& events = store_.all_events();
   std::ostringstream text;
   text << "HashSpec Console\n\n";
   if (blocks.empty()) {
     text << "No blocks found.\n";
     return text.str();
   }
-
-  std::unordered_map<std::string, std::string> payload_hash_by_event;
-  payload_hash_by_event.reserve(events.size());
-  for (const auto& event : events) {
-    payload_hash_by_event[event.event_id] = util::sha256_like_hex(event.payload);
-  }
-
   const auto& latest = blocks.back();
-  const std::uint64_t next_index = latest.index + 1U;
-  const std::int64_t next_open_unix = latest.opened_unix + static_cast<std::int64_t>(config_.block_interval_seconds);
-  const std::string prev_hash = latest.block_hash.empty() ? "genesis" : latest.block_hash;
+  const MiningTemplate tpl = mining_template();
 
-  std::vector<std::string> next_event_ids;
-  if (latest.reserved && latest.event_ids.empty()) {
-    next_event_ids = {};
-  } else {
-    next_event_ids = {};
-  }
-
-  std::vector<std::string> merkle_leaves;
-  std::vector<std::string> content_parts;
-  for (const auto& event_id : next_event_ids) {
-    const auto it = payload_hash_by_event.find(event_id);
-    const std::string payload_hash = it == payload_hash_by_event.end() ? "missing" : it->second;
-    merkle_leaves.push_back(util::sha256_like_hex(event_id + ":" + payload_hash));
-    content_parts.push_back(event_id + ":" + payload_hash);
-  }
-  const std::string anticipated_merkle = preview_merkle_root(merkle_leaves);
-  const std::string anticipated_content_hash = util::sha256_like_hex(join_parts(content_parts));
-
-  std::ostringstream block_input;
-  block_input << next_index << "|" << next_open_unix << "|" << 1 << "|" << 0 << "|" << 0 << "|"
-              << prev_hash << "|" << anticipated_merkle << "|" << anticipated_content_hash << "|";
-  const std::string anticipated_block_hash = util::sha256_like_hex(block_input.str());
-
-  const bool testnet = should_use_testnet(alpha_test_mode_, active_mode_);
-  const int difficulty_nibbles = testnet ? 3 : 4;
-  const std::string pow_material =
-      current_community_.community_id + "|" + crypto_.identity().cid.value + "|" + std::to_string(next_index) +
-      "|" + anticipated_block_hash + "|" + anticipated_merkle;
-
-  text << "Chain: " << (testnet ? config_.testnet_chain_id : config_.mainnet_chain_id) << "\n";
-  text << "Network: " << (testnet ? "testnet" : "mainnet") << "\n";
+  text << "Chain: " << tpl.chain_id << "\n";
+  text << "Network: " << tpl.network_id << "\n";
   text << "Latest Block Index: " << latest.index << "\n";
   text << "Latest Block Hash: " << latest.block_hash << "\n";
   text << "Latest Merkle Root: " << latest.merkle_root << "\n\n";
 
   text << "Next Block Anticipation\n";
-  text << "- Next Index: " << next_index << "\n";
-  text << "- Prev Hash: " << prev_hash << "\n";
-  text << "- Provisional Event Count: " << next_event_ids.size() << "\n";
-  text << "- Anticipated Merkle Root: " << anticipated_merkle << "\n";
-  text << "- Anticipated Content Hash: " << anticipated_content_hash << "\n";
-  text << "- Anticipated Block Hash: " << anticipated_block_hash << "\n\n";
+  text << "- Next Index: " << tpl.next_block_index << "\n";
+  text << "- Prev Hash: " << tpl.prev_hash << "\n";
+  text << "- Provisional Event Count: " << tpl.provisional_event_count << "\n";
+  text << "- Anticipated Merkle Root: " << tpl.merkle_root << "\n";
+  text << "- Anticipated Content Hash: " << tpl.content_hash << "\n";
+  text << "- Anticipated Block Hash: " << tpl.anticipated_block_hash << "\n";
+  text << "- Pool Protocol Hint: " << tpl.pool_protocol_hint << "\n";
+  text << "- Algorithm: " << tpl.algorithm << "\n\n";
 
   text << "PoW Preview\n";
-  text << "- Difficulty (leading zero nibbles): " << difficulty_nibbles << "\n";
-  text << "- Material: " << pow_material << "\n";
+  text << "- Difficulty (leading zero nibbles): " << tpl.difficulty_nibbles << "\n";
+  text << "- Material: " << tpl.pow_material << "\n";
   text << "- Samples:\n";
   for (std::uint64_t attempt = 0; attempt < 5U; ++attempt) {
-    const std::string sample = util::sha256_like_hex(pow_material + "|" + std::to_string(attempt));
+    const std::string sample = util::sha256_like_hex(tpl.pow_material + "|" + std::to_string(attempt));
     text << "  nonce " << attempt << " => " << sample << "\n";
   }
 
@@ -1753,8 +2065,8 @@ std::string AlphaService::hashspec_console() const {
   std::string found_hash;
   constexpr std::uint64_t kPreviewAttempts = 200000;
   for (std::uint64_t attempt = 0; attempt < kPreviewAttempts; ++attempt) {
-    const std::string candidate = util::sha256_like_hex(pow_material + "|" + std::to_string(attempt));
-    if (util::has_leading_zero_nibbles(candidate, difficulty_nibbles)) {
+    const std::string candidate = util::sha256_like_hex(tpl.pow_material + "|" + std::to_string(attempt));
+    if (util::has_leading_zero_nibbles(candidate, tpl.difficulty_nibbles)) {
       found_nonce = attempt;
       found_hash = candidate;
       break;
@@ -2313,14 +2625,7 @@ Result AlphaService::append_locally_and_queue(const EventEnvelope& event) {
 EventEnvelope AlphaService::make_event(EventKind kind,
                                        std::vector<std::pair<std::string, std::string>> payload_fields) {
   const std::int64_t now = util::unix_timestamp_now();
-  std::int64_t event_unix_ts = now;
-  if (event_unix_ts <= last_local_event_unix_ts_) {
-    const std::int64_t target = last_local_event_unix_ts_ + 1;
-    while (event_unix_ts < target) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(2));
-      event_unix_ts = util::unix_timestamp_now();
-    }
-  }
+  std::int64_t event_unix_ts = std::max(now, last_local_event_unix_ts_ + 1);
   last_local_event_unix_ts_ = event_unix_ts;
   const auto genesis = active_genesis_spec();
   payload_fields.emplace_back("author_cid", crypto_.identity().cid.value);
@@ -2719,6 +3024,37 @@ Result AlphaService::ensure_wallet_unlocked(std::string_view operation) const {
   return Result::success();
 }
 
+Result AlphaService::ensure_wallet_ready_for_mutation(std::string_view operation) const {
+  if (const Result unlocked = ensure_wallet_unlocked(operation); !unlocked.ok) {
+    return unlocked;
+  }
+  if (wallet_backup_required_ || !onboarding_complete_) {
+    return Result::failure("Wallet backup must be exported and verified before `" + std::string{operation} +
+                           "`. Use Wallet/Profile backup tools first.");
+  }
+  return Result::success();
+}
+
+Result AlphaService::verify_backup_preflight(std::string_view backup_path, std::string_view password) const {
+  const std::string resolved = resolve_data_path(backup_path, "backup/identity-backup.dat");
+  if (!std::filesystem::exists(std::filesystem::path{resolved})) {
+    return Result::failure("Backup preflight failed: backup file does not exist.");
+  }
+  return crypto_.verify_identity_backup(resolved, password);
+}
+
+void AlphaService::refresh_backup_state() {
+  wallet_backup_exists_ = !last_key_backup_path_.empty() &&
+                          std::filesystem::exists(std::filesystem::path{last_key_backup_path_});
+  if (!wallet_backup_exists_) {
+    wallet_backup_verified_ = false;
+  }
+  wallet_backup_required_ = !wallet_backup_verified_ ||
+                            backup_last_unix_ <= 0 ||
+                            backup_last_unix_ < wallet_identity_changed_unix_;
+  onboarding_complete_ = wallet_backup_exists_ && wallet_backup_verified_ && !wallet_backup_required_;
+}
+
 GenesisSpec AlphaService::active_genesis_spec() const {
   const bool testnet = should_use_testnet(alpha_test_mode_, active_mode_);
   const std::string network_id = testnet ? "testnet" : "mainnet";
@@ -2754,9 +3090,15 @@ Result AlphaService::load_profile_state() {
   reject_duplicate_names_ = true;
   wallet_destroyed_ = false;
   wallet_recovery_required_ = false;
+  wallet_backup_exists_ = false;
+  wallet_backup_verified_ = false;
+  wallet_backup_required_ = true;
+  onboarding_complete_ = false;
   last_key_backup_path_.clear();
+  backup_last_unix_ = 0;
   wallet_last_locked_unix_ = 0;
   wallet_last_unlocked_unix_ = crypto_.last_unlocked_unix();
+  wallet_identity_changed_unix_ = wallet_last_unlocked_unix_;
 
   std::ifstream in(profile_state_path_);
   if (!in) {
@@ -2799,12 +3141,34 @@ Result AlphaService::load_profile_state() {
   if (fields.contains("last_key_backup_path")) {
     last_key_backup_path_ = fields["last_key_backup_path"];
   }
+  if (fields.contains("wallet_backup_exists")) {
+    wallet_backup_exists_ = fields["wallet_backup_exists"] == "1" || fields["wallet_backup_exists"] == "true";
+  }
+  if (fields.contains("wallet_backup_verified")) {
+    wallet_backup_verified_ =
+        fields["wallet_backup_verified"] == "1" || fields["wallet_backup_verified"] == "true";
+  }
+  if (fields.contains("wallet_backup_required")) {
+    wallet_backup_required_ =
+        fields["wallet_backup_required"] == "1" || fields["wallet_backup_required"] == "true";
+  }
+  if (fields.contains("onboarding_complete")) {
+    onboarding_complete_ = fields["onboarding_complete"] == "1" || fields["onboarding_complete"] == "true";
+  }
+  if (fields.contains("backup_last_unix")) {
+    backup_last_unix_ = parse_int64_default(fields["backup_last_unix"], 0);
+  }
   if (fields.contains("wallet_last_locked_unix")) {
     wallet_last_locked_unix_ = parse_int64_default(fields["wallet_last_locked_unix"], 0);
   }
   if (fields.contains("wallet_last_unlocked_unix")) {
     wallet_last_unlocked_unix_ = parse_int64_default(fields["wallet_last_unlocked_unix"], 0);
   }
+  if (fields.contains("wallet_identity_changed_unix")) {
+    wallet_identity_changed_unix_ = parse_int64_default(fields["wallet_identity_changed_unix"],
+                                                        wallet_last_unlocked_unix_);
+  }
+  refresh_backup_state();
 
   return Result::success("Profile state loaded.");
 }
@@ -2834,9 +3198,15 @@ Result AlphaService::save_profile_state() const {
   out << "duplicate_policy=" << (reject_duplicate_names_ ? "reject" : "allow") << '\n';
   out << "wallet_destroyed=" << (wallet_destroyed_ ? "1" : "0") << '\n';
   out << "wallet_recovery_required=" << (wallet_recovery_required_ ? "1" : "0") << '\n';
+  out << "wallet_backup_exists=" << (wallet_backup_exists_ ? "1" : "0") << '\n';
+  out << "wallet_backup_verified=" << (wallet_backup_verified_ ? "1" : "0") << '\n';
+  out << "wallet_backup_required=" << (wallet_backup_required_ ? "1" : "0") << '\n';
+  out << "onboarding_complete=" << (onboarding_complete_ ? "1" : "0") << '\n';
   out << "last_key_backup_path=" << last_key_backup_path_ << '\n';
+  out << "backup_last_unix=" << backup_last_unix_ << '\n';
   out << "wallet_last_locked_unix=" << wallet_last_locked_unix_ << '\n';
   out << "wallet_last_unlocked_unix=" << wallet_last_unlocked_unix_ << '\n';
+  out << "wallet_identity_changed_unix=" << wallet_identity_changed_unix_ << '\n';
   if (!out.good()) {
     return Result::failure("Failed writing profile state file.");
   }

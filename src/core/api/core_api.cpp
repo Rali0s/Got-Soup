@@ -92,6 +92,10 @@ Result CoreApi::set_content_hidden(std::string_view object_id, bool hidden, std:
   return service_.set_content_hidden(object_id, hidden, reason);
 }
 
+Result CoreApi::downvote_and_purge_content(std::string_view object_id, std::string_view reason) {
+  return service_.downvote_and_purge_content(object_id, reason);
+}
+
 Result CoreApi::pin_core_topic(std::string_view recipe_id, bool pinned) {
   return service_.pin_core_topic(recipe_id, pinned);
 }
@@ -99,6 +103,10 @@ Result CoreApi::pin_core_topic(std::string_view recipe_id, bool pinned) {
 Result CoreApi::export_key_backup(std::string_view backup_path, std::string_view password,
                                   std::string_view salt) {
   return service_.export_key_backup(backup_path, password, salt);
+}
+
+Result CoreApi::verify_key_backup(std::string_view backup_path, std::string_view password) {
+  return service_.verify_key_backup(backup_path, password);
 }
 
 Result CoreApi::import_key_backup(std::string_view backup_path, std::string_view password) {
@@ -116,6 +124,10 @@ Result CoreApi::unlock_wallet(std::string_view passphrase) {
 Result CoreApi::recover_wallet(std::string_view backup_path, std::string_view backup_password,
                                std::string_view new_local_passphrase) {
   return service_.recover_wallet(backup_path, backup_password, new_local_passphrase);
+}
+
+Result CoreApi::prepare_genesis_reset() {
+  return service_.prepare_genesis_reset();
 }
 
 Result CoreApi::nuke_key(std::string_view confirmation_phrase) {
@@ -165,6 +177,10 @@ std::vector<RewardTransactionSummary> CoreApi::reward_transactions() const {
 
 ReceiveAddressInfo CoreApi::receive_info() const {
   return service_.receive_info();
+}
+
+MiningTemplate CoreApi::mining_template() const {
+  return service_.mining_template();
 }
 
 std::string CoreApi::hashspec_console() const {

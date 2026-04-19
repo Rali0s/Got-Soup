@@ -1149,8 +1149,18 @@ Result Store::routine_block_check(std::int64_t now_unix) {
 Result Store::backtest_validate(const std::function<std::string(std::string_view)>& content_id_fn,
                                 std::string_view expected_community_id) {
   std::size_t issues = 0;
+  std::size_t historical_timestamp_warnings = 0;
   std::ostringstream details;
   std::unordered_map<std::string, std::string> event_payload_hash;
+  const std::int64_t now = util::unix_timestamp_now();
+  const auto checkpoint = latest_checkpoint_block();
+
+  if (checkpoint.has_value()) {
+    details << "Replay anchor checkpoint: block " << checkpoint->index << " hash="
+            << checkpoint->block_hash << " opened_unix=" << checkpoint->opened_unix << "\n";
+  } else {
+    details << "Replay anchor checkpoint: none available yet; validating full historical log.\n";
+  }
 
   for (const auto& event : events_) {
     if (event.event_id != content_id_fn(event.payload)) {
@@ -1161,14 +1171,22 @@ Result Store::backtest_validate(const std::function<std::string(std::string_view
       ++issues;
       details << "Event payload exceeds max_event_bytes: " << event.event_id << "\n";
     }
-    const std::int64_t now = util::unix_timestamp_now();
     if (event.unix_ts > now + validation_limits_.max_future_drift_seconds) {
       ++issues;
-      details << "Event timestamp exceeds future drift: " << event.event_id << "\n";
-    }
-    if (event.unix_ts < now - validation_limits_.max_past_drift_seconds) {
-      ++issues;
-      details << "Event timestamp exceeds past drift: " << event.event_id << "\n";
+      details << "Event timestamp exceeds future drift: " << event.event_id
+              << " unix_ts=" << event.unix_ts << " now=" << now << "\n";
+    } else if (event.unix_ts < now - validation_limits_.max_past_drift_seconds) {
+      // Historical replay is anchored to the chain timeline, not today's wall clock.
+      ++historical_timestamp_warnings;
+      if (historical_timestamp_warnings <= 10) {
+        details << "Historical event predates live past-drift window but is retained during replay: "
+                << event.event_id;
+        if (checkpoint.has_value()) {
+          details << " checkpoint_block=" << checkpoint->index
+                  << " checkpoint_opened_unix=" << checkpoint->opened_unix;
+        }
+        details << "\n";
+      }
     }
 
     const auto payload = util::parse_canonical_map(event.payload);
@@ -1372,10 +1390,24 @@ Result Store::backtest_validate(const std::function<std::string(std::string_view
   if (issues == 0) {
     backtest_ok_ = true;
     backtest_details_ = "Backtest validation passed. Event and block timelines are immutable and coherent.";
+    if (historical_timestamp_warnings > 0) {
+      backtest_details_ += " Historical replay retained " + std::to_string(historical_timestamp_warnings) +
+                           " event(s) older than the live past-drift window.";
+      if (checkpoint.has_value()) {
+        backtest_details_ += " Replay was anchored to checkpoint block " +
+                             std::to_string(checkpoint->index) + ".";
+      }
+    }
     return Result::success(backtest_details_);
   }
 
   backtest_ok_ = false;
+  if (historical_timestamp_warnings > 10) {
+    details << "Historical replay retained an additional "
+            << std::to_string(historical_timestamp_warnings - 10)
+            << " old event(s) beyond the examples listed above.\n";
+  }
+  details << "System clock note: future-drift failures often indicate a bad local clock or unsynced peer time.\n";
   backtest_details_ = details.str();
   if (backtest_details_.empty()) {
     backtest_details_ = "Backtest failed with unknown validation issue.";
@@ -1692,6 +1724,11 @@ DbHealthReport Store::health_report() const {
   report.checkpoint_interval_blocks = chain_policy_.checkpoint_interval_blocks;
   report.checkpoint_confirmations = chain_policy_.checkpoint_confirmations;
   report.checkpoint_count = checkpoint_count_;
+  if (const auto checkpoint = latest_checkpoint_block(); checkpoint.has_value()) {
+    report.last_checkpoint_block_index = checkpoint->index;
+    report.last_checkpoint_block_hash = checkpoint->block_hash;
+    report.last_checkpoint_opened_unix = checkpoint->opened_unix;
+  }
   report.max_block_events = validation_limits_.max_block_events;
   report.max_block_bytes = validation_limits_.max_block_bytes;
   report.max_event_bytes = validation_limits_.max_event_bytes;
@@ -1780,6 +1817,31 @@ DbHealthReport Store::health_report() const {
   }
 
   return report;
+}
+
+std::optional<Store::BlockRecord> Store::latest_checkpoint_block() const {
+  const auto latest_confirmed = latest_confirmed_block_index();
+  if (!latest_confirmed.has_value()) {
+    return std::nullopt;
+  }
+
+  std::optional<BlockRecord> result;
+  for (const auto& block : blocks_) {
+    if (!block.confirmed || block.index == 0) {
+      continue;
+    }
+    if (chain_policy_.checkpoint_interval_blocks > 0 &&
+        (block.index % chain_policy_.checkpoint_interval_blocks) != 0U) {
+      continue;
+    }
+    const std::uint64_t confirmations =
+        (*latest_confirmed >= block.index) ? ((*latest_confirmed - block.index) + 1U) : 0U;
+    if (confirmations < chain_policy_.checkpoint_confirmations) {
+      continue;
+    }
+    result = block;
+  }
+  return result;
 }
 
 Result Store::load_event_log() {

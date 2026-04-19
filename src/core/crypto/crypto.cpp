@@ -442,6 +442,42 @@ Result CryptoEngine::export_identity_backup(std::string_view backup_path, std::s
   return Result::success("Key export completed.", path.string());
 }
 
+Result CryptoEngine::verify_identity_backup(std::string_view backup_path, std::string_view password) const {
+  if (backup_path.empty()) {
+    return Result::failure("Key backup verification failed: backup path is required.");
+  }
+  if (password.empty()) {
+    return Result::failure("Key backup verification failed: backup password is required.");
+  }
+
+  const std::string file_text = read_file(std::filesystem::path{std::string{backup_path}});
+  if (file_text.empty()) {
+    return Result::failure("Key backup verification failed: backup file could not be read.");
+  }
+
+  const auto values = parse_key_values(file_text);
+  if (!values.contains("format") || values.at("format") != kBackupFormat) {
+    return Result::failure("Key backup verification failed: unsupported backup format.");
+  }
+  if (!values.contains("salt") || !values.contains("cipher")) {
+    return Result::failure("Key backup verification failed: missing salt/cipher fields.");
+  }
+
+  const std::string key = derive_vault_key(password, "backup:" + values.at("salt"));
+  const std::string cipher = from_hex(values.at("cipher"));
+  if (cipher.empty()) {
+    return Result::failure("Key backup verification failed: cipher payload is invalid.");
+  }
+
+  const std::string plain = xor_stream(cipher, key);
+  IdentityKeyPair imported = parse_identity(plain);
+  if (imported.private_key.empty() || imported.public_key.empty() || imported.cid.empty()) {
+    return Result::failure("Key backup verification failed: wrong password or corrupt backup.");
+  }
+
+  return Result::success("Key backup verification completed.", imported.cid.value);
+}
+
 Result CryptoEngine::import_identity_backup(std::string_view backup_path, std::string_view password,
                                             std::string_view local_passphrase) {
   if (backup_path.empty()) {

@@ -159,6 +159,39 @@ bool write_developer_mode_flag(const std::string& file_path, bool enabled) {
   return static_cast<bool>(out);
 }
 
+std::string trim_copy(std::string_view text) {
+  size_t start = 0;
+  while (start < text.size() && std::isspace(static_cast<unsigned char>(text[start]))) {
+    ++start;
+  }
+  size_t end = text.size();
+  while (end > start && std::isspace(static_cast<unsigned char>(text[end - 1]))) {
+    --end;
+  }
+  return std::string{text.substr(start, end - start)};
+}
+
+std::string wallet_status_banner(const alpha::NodeStatusReport& node) {
+  std::string text;
+  text += "Safety Status\n";
+  text += "- Wallet: ";
+  text += (node.wallet.locked ? "LOCKED" : "UNLOCKED");
+  text += "\n- Backup: ";
+  text += (node.wallet.backup_verified ? "VERIFIED" : (node.wallet.backup_exists ? "EXPORTED / NOT VERIFIED"
+                                                                               : "MISSING"));
+  text += "\n- Crypto Mode: " + node.wallet.crypto_mode + "\n";
+  if (node.wallet.backup_required) {
+    text += "- Action Required: Export and verify a wallet backup before posting, sending, or profile changes.\n";
+  }
+  if (!node.startup_recovery_summary.empty()) {
+    text += "- Recovery: " + node.startup_recovery_summary + "\n";
+    if (!node.startup_recovery_path.empty()) {
+      text += "- Recovery Path: " + node.startup_recovery_path + "\n";
+    }
+  }
+  return text + "\n";
+}
+
 }  // namespace
 
 @interface GotSoupMacController
@@ -172,6 +205,8 @@ bool write_developer_mode_flag(const std::string& file_path, bool enabled) {
   NSPopUpButton* _parent_menu;
   NSPopUpButton* _secondary_menu;
   NSTableView* _lookup_table;
+  NSPopUpButton* _recipe_picker;
+  NSPopUpButton* _forum_thread_picker;
 
   NSTabView* _tab_view;
   NSTextView* _recipes_text;
@@ -200,6 +235,7 @@ bool write_developer_mode_flag(const std::string& file_path, bool enabled) {
   NSSecureTextField* _profile_export_password_field;
   NSTextField* _profile_export_salt_field;
   NSButton* _profile_export_button;
+  NSButton* _profile_verify_backup_button;
   NSTextField* _profile_import_path_field;
   NSSecureTextField* _profile_import_password_field;
   NSButton* _profile_import_button;
@@ -217,6 +253,7 @@ bool write_developer_mode_flag(const std::string& file_path, bool enabled) {
   NSButton* _sign_button;
   NSTextView* _signature_text;
   NSTextView* _receive_text;
+  NSButton* _receive_reveal_button;
   NSTextView* _transactions_text;
   NSTextView* _hashspec_text;
   NSTextView* _about_text;
@@ -224,6 +261,7 @@ bool write_developer_mode_flag(const std::string& file_path, bool enabled) {
   NSButton* _settings_lock_wallet_button;
   NSSecureTextField* _settings_unlock_password_field;
   NSButton* _settings_unlock_wallet_button;
+  NSButton* _settings_genesis_reset_button;
   NSTextField* _settings_recover_path_field;
   NSSecureTextField* _settings_recover_backup_password_field;
   NSSecureTextField* _settings_recover_local_password_field;
@@ -249,6 +287,9 @@ bool write_developer_mode_flag(const std::string& file_path, bool enabled) {
   std::unique_ptr<alpha::CoreApi> _api;
   std::vector<std::string> _opening_keys;
   std::vector<alpha::RecipeSummary> _recipes;
+  std::vector<alpha::ThreadSummary> _threads;
+  bool _suppress_picker_actions;
+  bool _receive_private_key_visible;
   bool _developer_mode;
   std::string _ui_mode_file_path;
   NSTimer* _live_timer;
@@ -302,6 +343,28 @@ bool write_developer_mode_flag(const std::string& file_path, bool enabled) {
   return text_view;
 }
 
+- (const alpha::RecipeSummary*)selectedRecipe {
+  if (_recipes.empty()) {
+    return nullptr;
+  }
+  NSInteger index = [_recipe_picker indexOfSelectedItem];
+  if (index < 0 || static_cast<size_t>(index) >= _recipes.size()) {
+    return &_recipes.front();
+  }
+  return &_recipes[static_cast<size_t>(index)];
+}
+
+- (const alpha::ThreadSummary*)selectedThread {
+  if (_threads.empty()) {
+    return nullptr;
+  }
+  NSInteger index = [_forum_thread_picker indexOfSelectedItem];
+  if (index < 0 || static_cast<size_t>(index) >= _threads.size()) {
+    return &_threads.front();
+  }
+  return &_threads[static_cast<size_t>(index)];
+}
+
 - (void)refreshProfileAndAbout {
   const auto profile = _api->profile();
   const auto node = _api->node_status();
@@ -312,6 +375,7 @@ bool write_developer_mode_flag(const std::string& file_path, bool enabled) {
 
   const std::string soup_address = soup_address_from_cid(profile.cid.value);
   std::string profile_text;
+  profile_text += wallet_status_banner(node);
   profile_text += "CID: " + profile.cid.value + "\n";
   profile_text += std::string{alpha::kNetworkDisplayName} + " Address: " + soup_address + "\n";
   profile_text += "Display Name: " + profile.display_name + "\n";
@@ -331,6 +395,9 @@ bool write_developer_mode_flag(const std::string& file_path, bool enabled) {
   profile_text += "Active Transport: ";
   profile_text += (node.active_mode == alpha::AnonymityMode::I2P ? "I2P" : "Tor");
   profile_text += "\n";
+  if (!node.wallet.backup_last_path.empty()) {
+    [_profile_export_path_field setStringValue:to_ns_string(node.wallet.backup_last_path)];
+  }
   [_profile_text setString:to_ns_string(profile_text)];
 
   std::string about;
@@ -380,35 +447,58 @@ bool write_developer_mode_flag(const std::string& file_path, bool enabled) {
   std::string forum;
   forum += "Forum Summary\n\n";
 
-  if (_recipes.empty()) {
+  const std::string previous_thread_title = from_ns_string([_forum_thread_picker titleOfSelectedItem]);
+  _suppress_picker_actions = true;
+  [_forum_thread_picker removeAllItems];
+
+  const alpha::RecipeSummary* recipe = [self selectedRecipe];
+  if (recipe == nullptr) {
+    _threads.clear();
+    _suppress_picker_actions = false;
     forum += "No recipes yet. Upload one from the Upload tab.\n";
     [_forum_text setString:to_ns_string(forum)];
     return;
   }
 
-  const auto& recipe = _recipes.front();
-  const auto threads = _api->threads(recipe.recipe_id);
-  forum += "Recipe: " + recipe.title + "\n";
-  forum += "Recipe ID: " + recipe.recipe_id + "\n";
-  forum += "Segment: ";
-  forum += (recipe.core_topic ? "CORE TOPIC" : "COMMUNITY POST");
-  forum += "\n";
-  forum += "Thread count: " + std::to_string(threads.size()) + "\n\n";
+  _threads = _api->threads(recipe->recipe_id);
+  NSInteger selected_thread_index = -1;
+  for (size_t i = 0; i < _threads.size(); ++i) {
+    const auto& thread = _threads[i];
+    const std::string label = thread.title + " (" + std::to_string(thread.reply_count) + " replies)";
+    [_forum_thread_picker addItemWithTitle:to_ns_string(label)];
+    if (!previous_thread_title.empty() && previous_thread_title == label) {
+      selected_thread_index = static_cast<NSInteger>(i);
+    }
+  }
+  if (!_threads.empty()) {
+    [_forum_thread_picker selectItemAtIndex:(selected_thread_index >= 0 ? selected_thread_index : 0)];
+  }
+  _suppress_picker_actions = false;
 
-  for (const auto& thread : threads) {
+  forum += "Recipe: " + recipe->title + "\n";
+  forum += "Recipe ID: " + recipe->recipe_id + "\n";
+  forum += "Segment: ";
+  forum += (recipe->core_topic ? "CORE TOPIC" : "COMMUNITY POST");
+  forum += "\n";
+  forum += "Thread count: " + std::to_string(_threads.size()) + "\n\n";
+
+  for (const auto& thread : _threads) {
     forum += "- " + thread.title + " [thread_id=" + thread.thread_id + "]";
     forum += " (replies: " + std::to_string(thread.reply_count) + ")\n";
   }
 
-  if (threads.empty()) {
+  const alpha::ThreadSummary* selected_thread = [self selectedThread];
+  if (_threads.empty()) {
     forum += "No forum threads yet for this recipe. Use the fields below to create one.\n";
+  } else if (selected_thread == nullptr) {
+    forum += "\nChoose a thread above to inspect replies.\n";
   } else {
-    const auto replies = _api->replies(threads.front().thread_id);
-    forum += "\nLatest thread target for reply: " + threads.front().thread_id + "\n";
+    const auto replies = _api->replies(selected_thread->thread_id);
+    forum += "\nReply target: " + selected_thread->title + " [" + selected_thread->thread_id + "]\n";
     if (replies.empty()) {
       forum += "No replies yet. Add a reply below.\n";
     } else {
-      forum += "Replies in latest thread:\n";
+      forum += "Replies in selected thread:\n";
       for (const auto& reply : replies) {
         forum += "  * [" + reply.reply_id + "] " + reply.author_cid + "\n";
       }
@@ -420,10 +510,28 @@ bool write_developer_mode_flag(const std::string& file_path, bool enabled) {
 
 - (void)refreshRecipesTab {
   const std::string query = from_ns_string([_search_field stringValue]);
+  const auto node = _api->node_status();
+  const std::string previous_recipe_title = from_ns_string([_recipe_picker titleOfSelectedItem]);
   _recipes = _api->search({.text = query, .category = {}});
+  _suppress_picker_actions = true;
+  [_recipe_picker removeAllItems];
+  NSInteger selected_index = -1;
+  for (size_t i = 0; i < _recipes.size(); ++i) {
+    const auto& recipe = _recipes[i];
+    const std::string label = recipe.title + " [" + recipe.category + "]";
+    [_recipe_picker addItemWithTitle:to_ns_string(label)];
+    if (!previous_recipe_title.empty() && previous_recipe_title == label) {
+      selected_index = static_cast<NSInteger>(i);
+    }
+  }
+  if (!_recipes.empty()) {
+    [_recipe_picker selectItemAtIndex:(selected_index >= 0 ? selected_index : 0)];
+  }
+  _suppress_picker_actions = false;
 
   std::string output;
-  output += "Recipes\n\n";
+  output += wallet_status_banner(node);
+  output += "Home\n\n";
 
   if (_recipes.empty()) {
     output += "No recipes found for current query.\n\n";
@@ -435,6 +543,17 @@ bool write_developer_mode_flag(const std::string& file_path, bool enabled) {
     output += " 👍" + std::to_string(recipe.thumbs_up_count);
     output += " rating=" + std::to_string(recipe.average_rating);
     output += " (" + std::to_string(recipe.review_count) + ")\n";
+  }
+
+  if (const alpha::RecipeSummary* selected_recipe = [self selectedRecipe]; selected_recipe != nullptr) {
+    output += "\nSelected Recipe\n";
+    output += "Title: " + selected_recipe->title + "\n";
+    output += "Recipe ID: " + selected_recipe->recipe_id + "\n";
+    output += "Category: " + selected_recipe->category + "\n";
+    output += "Author CID: " + selected_recipe->author_cid + "\n";
+    output += "Thumbs Up: " + std::to_string(selected_recipe->thumbs_up_count) + "\n";
+    output += "Rating: " + std::to_string(selected_recipe->average_rating) + " (" +
+              std::to_string(selected_recipe->review_count) + ")\n";
   }
 
   NSInteger selected_row = [_lookup_table selectedRow];
@@ -537,6 +656,10 @@ bool write_developer_mode_flag(const std::string& file_path, bool enabled) {
   text += "Checkpoint interval: " + std::to_string(node.db.checkpoint_interval_blocks) + "\n";
   text += "Checkpoint confirmations: " + std::to_string(node.db.checkpoint_confirmations) + "\n";
   text += "Checkpoint count: " + std::to_string(node.db.checkpoint_count) + "\n";
+  text += "Last checkpoint block: " + std::to_string(node.db.last_checkpoint_block_index) + "\n";
+  if (!node.db.last_checkpoint_block_hash.empty()) {
+    text += "Last checkpoint hash: " + node.db.last_checkpoint_block_hash + "\n";
+  }
   text += "Blockdata format: v" + std::to_string(node.db.blockdata_format_version) + "\n";
   text += "Recovered from corruption: ";
   text += (node.db.recovered_from_corruption ? "YES" : "NO");
@@ -599,6 +722,8 @@ bool write_developer_mode_flag(const std::string& file_path, bool enabled) {
 
   const auto transactions = _api->reward_transactions();
   std::string tx_text;
+  tx_text += wallet_status_banner(node);
+  tx_text += "Recent activity\n\n";
   if (transactions.empty()) {
     tx_text += "No recent transactions.\n";
   } else {
@@ -625,17 +750,23 @@ bool write_developer_mode_flag(const std::string& file_path, bool enabled) {
 
 - (void)refreshSendReceiveTransactionsTabs {
   const auto receive = _api->receive_info();
+  const auto node = _api->node_status();
   std::string receive_text;
+  receive_text += wallet_status_banner(node);
   receive_text += "Receive\n\n";
   receive_text += "Display Name: " + receive.display_name + "\n";
   receive_text += "CID: " + receive.cid + "\n";
   receive_text += "Address: " + receive.address + "\n\n";
   receive_text += "PubKey:\n" + receive.public_key + "\n\n";
-  receive_text += "PrivKey:\n" + receive.private_key + "\n";
+  receive_text += "PrivKey:\n";
+  receive_text += _receive_private_key_visible ? _api->private_key() : "[hidden - click Reveal Private Key]";
+  receive_text += "\n";
   [_receive_text setString:to_ns_string(receive_text)];
+  [_receive_reveal_button setTitle:(_receive_private_key_visible ? @"Hide Private Key" : @"Reveal Private Key")];
 
   const auto transactions = _api->reward_transactions();
   std::string tx_text;
+  tx_text += wallet_status_banner(node);
   tx_text += "Transactions History\n\n";
   if (transactions.empty()) {
     tx_text += "No transfer events found.\n";
@@ -662,6 +793,7 @@ bool write_developer_mode_flag(const std::string& file_path, bool enabled) {
 - (void)refreshSettingsTab {
   const auto node = _api->node_status();
   std::string text;
+  text += wallet_status_banner(node);
   text += "Settings Panel\n\n";
   text += "Data Dir: " + node.data_dir + "\n";
   text += "Events: " + node.db.events_file + "\n";
@@ -674,10 +806,20 @@ bool write_developer_mode_flag(const std::string& file_path, bool enabled) {
   text += "Wallet\n";
   text += "Locked: ";
   text += (node.wallet.locked ? "YES" : "NO");
+  text += "\nBackup Exists: ";
+  text += (node.wallet.backup_exists ? "YES" : "NO");
+  text += "\nBackup Verified: ";
+  text += (node.wallet.backup_verified ? "YES" : "NO");
+  text += "\nBackup Required: ";
+  text += (node.wallet.backup_required ? "YES" : "NO");
+  text += "\nOnboarding Complete: ";
+  text += (node.wallet.onboarding_complete ? "YES" : "NO");
+  text += "\nCrypto Mode: " + node.wallet.crypto_mode;
   text += "\nDestroyed: ";
   text += (node.wallet.destroyed ? "YES" : "NO");
   text += "\nRecovery Required: ";
   text += (node.wallet.recovery_required ? "YES" : "NO");
+  text += "\nLast verified/exported backup unix: " + std::to_string(node.wallet.backup_last_unix);
   text += "\nLast unlock unix: " + std::to_string(node.wallet.last_unlocked_unix);
   text += "\nLast lock unix: " + std::to_string(node.wallet.last_locked_unix) + "\n\n";
 
@@ -686,7 +828,12 @@ bool write_developer_mode_flag(const std::string& file_path, bool enabled) {
   text += "Fork choice: " + node.chain_policy.fork_choice_rule + "\n";
   text += "Max reorg depth: " + std::to_string(node.chain_policy.max_reorg_depth) + "\n";
   text += "Checkpoint interval: " + std::to_string(node.chain_policy.checkpoint_interval_blocks) + "\n";
-  text += "Checkpoint confirmations: " + std::to_string(node.chain_policy.checkpoint_confirmations) + "\n\n";
+  text += "Checkpoint confirmations: " + std::to_string(node.chain_policy.checkpoint_confirmations) + "\n";
+  text += "Last checkpoint block: " + std::to_string(node.db.last_checkpoint_block_index) + "\n";
+  if (!node.db.last_checkpoint_block_hash.empty()) {
+    text += "Last checkpoint hash: " + node.db.last_checkpoint_block_hash + "\n";
+  }
+  text += "\n";
 
   text += "Validation Limits\n";
   text += "Max block events: " + std::to_string(node.validation_limits.max_block_events) + "\n";
@@ -711,29 +858,30 @@ bool write_developer_mode_flag(const std::string& file_path, bool enabled) {
 
   [_settings_dev_mode_button setTitle:to_ns_string(_developer_mode ? "Disable Developer Mode (Reboot)"
                                                                    : "Enable Developer Mode (Reboot)")];
+  [_settings_genesis_reset_button setTitle:@"Prepare Fresh Genesis Reset"];
   [_settings_text setString:to_ns_string(text)];
 }
 
 - (void)applyUiModeVisibility {
   const BOOL dev = _developer_mode ? YES : NO;
-  [_search_field setHidden:!dev];
+  [_search_field setHidden:NO];
   [_parent_menu setHidden:!dev];
   [_secondary_menu setHidden:!dev];
   [[_lookup_table enclosingScrollView] setHidden:!dev];
 
-  [_recipes_thumb_button setHidden:!dev];
-  [_recipes_rate_menu setHidden:!dev];
-  [_recipes_rate_button setHidden:!dev];
+  [_recipes_thumb_button setHidden:NO];
+  [_recipes_rate_menu setHidden:NO];
+  [_recipes_rate_button setHidden:NO];
 
-  [_upload_title setHidden:!dev];
-  [_upload_category setHidden:!dev];
-  [[_upload_body enclosingScrollView] setHidden:!dev];
-  [_upload_button setHidden:!dev];
+  [_upload_title setHidden:NO];
+  [_upload_category setHidden:NO];
+  [[_upload_body enclosingScrollView] setHidden:NO];
+  [_upload_button setHidden:NO];
 
-  [_profile_name_field setHidden:!dev];
-  [_profile_set_name_button setHidden:!dev];
-  [_profile_duplicate_policy_toggle setHidden:!dev];
-  [_profile_apply_policy_button setHidden:!dev];
+  [_profile_name_field setHidden:NO];
+  [_profile_set_name_button setHidden:NO];
+  [_profile_duplicate_policy_toggle setHidden:NO];
+  [_profile_apply_policy_button setHidden:NO];
   [_profile_cipher_password_field setHidden:!dev];
   [_profile_cipher_salt_field setHidden:!dev];
   [_profile_cipher_apply_button setHidden:!dev];
@@ -747,34 +895,34 @@ bool write_developer_mode_flag(const std::string& file_path, bool enabled) {
   [_profile_import_button setHidden:!dev];
   [_profile_nuke_button setHidden:!dev];
 
-  [_send_address_field setHidden:!dev];
-  [_send_amount_field setHidden:!dev];
-  [_send_memo_field setHidden:!dev];
-  [_send_button setHidden:!dev];
-  [_sign_message_field setHidden:!dev];
-  [_sign_button setHidden:!dev];
-  [[_signature_text enclosingScrollView] setHidden:!dev];
+  [_send_address_field setHidden:NO];
+  [_send_amount_field setHidden:NO];
+  [_send_memo_field setHidden:NO];
+  [_send_button setHidden:NO];
+  [_sign_message_field setHidden:NO];
+  [_sign_button setHidden:NO];
+  [[_signature_text enclosingScrollView] setHidden:NO];
 
   [_node_tor_toggle setHidden:!dev];
   [_node_i2p_toggle setHidden:!dev];
   [_node_localhost_toggle setHidden:!dev];
   [_node_mode_menu setHidden:!dev];
   [_node_apply_button setHidden:!dev];
-  [_node_refresh_button setHidden:!dev];
+  [_node_refresh_button setHidden:NO];
   [_node_peer_field setHidden:!dev];
   [_node_add_peer_button setHidden:!dev];
   [_node_community_id_field setHidden:!dev];
   [_node_community_name_field setHidden:!dev];
   [_node_community_apply_button setHidden:!dev];
 
-  [_settings_lock_wallet_button setHidden:!dev];
-  [_settings_unlock_password_field setHidden:!dev];
-  [_settings_unlock_wallet_button setHidden:!dev];
+  [_settings_lock_wallet_button setHidden:NO];
+  [_settings_unlock_password_field setHidden:NO];
+  [_settings_unlock_wallet_button setHidden:NO];
   [_settings_recover_path_field setHidden:!dev];
   [_settings_recover_backup_password_field setHidden:!dev];
   [_settings_recover_local_password_field setHidden:!dev];
   [_settings_recover_wallet_button setHidden:!dev];
-  [_settings_validate_button setHidden:!dev];
+  [_settings_validate_button setHidden:NO];
 }
 
 - (void)onLiveTick:(NSTimer*)timer {
@@ -837,7 +985,13 @@ bool write_developer_mode_flag(const std::string& file_path, bool enabled) {
   [recipes_item setLabel:@"Home"];
   NSView* recipes_view = [[NSView alloc] initWithFrame:[_tab_view bounds]];
   [recipes_view setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
-  _recipes_text = [self makeReadOnlyTextViewInFrame:NSMakeRect(0.0, 34.0, frame.size.width, frame.size.height - 34.0)
+  _recipe_picker = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(0.0, frame.size.height - 28.0, frame.size.width - 300.0, 24.0)
+                                             pullsDown:NO];
+  [_recipe_picker setTarget:self];
+  [_recipe_picker setAction:@selector(onRecipeSelectionChanged:)];
+  [_recipe_picker setAutoresizingMask:NSViewWidthSizable | NSViewMinYMargin];
+  [recipes_view addSubview:_recipe_picker];
+  _recipes_text = [self makeReadOnlyTextViewInFrame:NSMakeRect(0.0, 34.0, frame.size.width, frame.size.height - 68.0)
                                               parent:recipes_view];
   _recipes_thumb_button = [[NSButton alloc] initWithFrame:NSMakeRect(0.0, 4.0, 120.0, 24.0)];
   [_recipes_thumb_button setTitle:@"Thumbs Up +1"];
@@ -879,14 +1033,21 @@ bool write_developer_mode_flag(const std::string& file_path, bool enabled) {
   _forum_text = [self makeReadOnlyTextViewInFrame:NSMakeRect(0.0, forum_summary_y, frame.size.width, forum_summary_h)
                                            parent:forum_view];
 
-  _forum_thread_title = [[NSTextField alloc] initWithFrame:NSMakeRect(0.0, forum_summary_y - 30.0,
+  _forum_thread_picker = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(0.0, forum_summary_y - 30.0, frame.size.width, 24.0)
+                                                   pullsDown:NO];
+  [_forum_thread_picker setTarget:self];
+  [_forum_thread_picker setAction:@selector(onForumThreadSelectionChanged:)];
+  [_forum_thread_picker setAutoresizingMask:NSViewWidthSizable | NSViewMinYMargin];
+  [forum_view addSubview:_forum_thread_picker];
+
+  _forum_thread_title = [[NSTextField alloc] initWithFrame:NSMakeRect(0.0, forum_summary_y - 60.0,
                                                                        frame.size.width - 122.0, 24.0)];
   [_forum_thread_title setPlaceholderString:@"Thread title"];
   [_forum_thread_title setAutoresizingMask:NSViewWidthSizable | NSViewMinYMargin];
   [forum_view addSubview:_forum_thread_title];
 
   _forum_create_thread_button =
-      [[NSButton alloc] initWithFrame:NSMakeRect(frame.size.width - 116.0, forum_summary_y - 30.0, 116.0, 24.0)];
+      [[NSButton alloc] initWithFrame:NSMakeRect(frame.size.width - 116.0, forum_summary_y - 60.0, 116.0, 24.0)];
   [_forum_create_thread_button setTitle:@"Create Thread"];
   [_forum_create_thread_button setButtonType:NSButtonTypeMomentaryPushIn];
   [_forum_create_thread_button setBezelStyle:NSBezelStyleRounded];
@@ -896,7 +1057,7 @@ bool write_developer_mode_flag(const std::string& file_path, bool enabled) {
   [forum_view addSubview:_forum_create_thread_button];
 
   NSScrollView* forum_thread_body_scroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(
-      0.0, forum_summary_y - 104.0, frame.size.width, 68.0)];
+      0.0, forum_summary_y - 134.0, frame.size.width, 68.0)];
   [forum_thread_body_scroll setHasVerticalScroller:YES];
   [forum_thread_body_scroll setAutoresizingMask:NSViewWidthSizable | NSViewMinYMargin];
   _forum_thread_body = [[NSTextView alloc] initWithFrame:[forum_thread_body_scroll bounds]];
@@ -915,7 +1076,7 @@ bool write_developer_mode_flag(const std::string& file_path, bool enabled) {
   [forum_view addSubview:_forum_create_reply_button];
 
   NSScrollView* forum_reply_body_scroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(
-      0.0, 34.0, frame.size.width - 122.0, std::max<CGFloat>(70.0, forum_summary_y - 140.0))];
+      0.0, 34.0, frame.size.width - 122.0, std::max<CGFloat>(70.0, forum_summary_y - 170.0))];
   [forum_reply_body_scroll setHasVerticalScroller:YES];
   [forum_reply_body_scroll setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
   _forum_reply_body = [[NSTextView alloc] initWithFrame:[forum_reply_body_scroll bounds]];
@@ -1035,7 +1196,7 @@ bool write_developer_mode_flag(const std::string& file_path, bool enabled) {
   const CGFloat row4 = top - ((row_h + gap) * 3.0);
   _profile_export_path_field =
       [[NSTextField alloc] initWithFrame:NSMakeRect(0.0, row4, std::max<CGFloat>(160.0, frame.size.width - 430.0), row_h)];
-  [_profile_export_path_field setStringValue:@"backup/identity-backup.dat"];
+  [_profile_export_path_field setPlaceholderString:@"Backup path"];
   [_profile_export_path_field setAutoresizingMask:NSViewWidthSizable | NSViewMinYMargin];
   [profile_view addSubview:_profile_export_path_field];
 
@@ -1064,7 +1225,7 @@ bool write_developer_mode_flag(const std::string& file_path, bool enabled) {
   const CGFloat row5 = top - ((row_h + gap) * 4.0);
   _profile_import_path_field =
       [[NSTextField alloc] initWithFrame:NSMakeRect(0.0, row5, std::max<CGFloat>(160.0, frame.size.width - 340.0), row_h)];
-  [_profile_import_path_field setStringValue:@"backup/identity-backup.dat"];
+  [_profile_import_path_field setPlaceholderString:@"Backup path"];
   [_profile_import_path_field setAutoresizingMask:NSViewWidthSizable | NSViewMinYMargin];
   [profile_view addSubview:_profile_import_path_field];
 
@@ -1228,7 +1389,16 @@ bool write_developer_mode_flag(const std::string& file_path, bool enabled) {
   [receive_item setLabel:@"Receive"];
   NSView* receive_view = [[NSView alloc] initWithFrame:[_tab_view bounds]];
   [receive_view setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
-  _receive_text = [self makeReadOnlyTextViewInFrame:[receive_view bounds] parent:receive_view];
+  _receive_reveal_button = [[NSButton alloc] initWithFrame:NSMakeRect(0.0, frame.size.height - 28.0, 150.0, 24.0)];
+  [_receive_reveal_button setTitle:@"Reveal Private Key"];
+  [_receive_reveal_button setButtonType:NSButtonTypeMomentaryPushIn];
+  [_receive_reveal_button setBezelStyle:NSBezelStyleRounded];
+  [_receive_reveal_button setTarget:self];
+  [_receive_reveal_button setAction:@selector(onToggleReceivePrivateKey:)];
+  [_receive_reveal_button setAutoresizingMask:NSViewMaxXMargin | NSViewMinYMargin];
+  [receive_view addSubview:_receive_reveal_button];
+  _receive_text = [self makeReadOnlyTextViewInFrame:NSMakeRect(0.0, 0.0, frame.size.width, frame.size.height - 34.0)
+                                             parent:receive_view];
   [receive_item setView:receive_view];
   [_tab_view addTabViewItem:receive_item];
 
@@ -1311,13 +1481,11 @@ bool write_developer_mode_flag(const std::string& file_path, bool enabled) {
 
   _node_community_id_field = [[NSTextField alloc] initWithFrame:NSMakeRect(0.0, frame.size.height - 86.0, 180.0, 24.0)];
   [_node_community_id_field setPlaceholderString:@"community-id"];
-  [_node_community_id_field setStringValue:@"recipes"];
   [_node_community_id_field setAutoresizingMask:NSViewMaxXMargin | NSViewMinYMargin];
   [node_view addSubview:_node_community_id_field];
 
   _node_community_name_field = [[NSTextField alloc] initWithFrame:NSMakeRect(186.0, frame.size.height - 86.0, frame.size.width - 286.0, 24.0)];
   [_node_community_name_field setPlaceholderString:@"Community name"];
-  [_node_community_name_field setStringValue:@"Recipe Community"];
   [_node_community_name_field setAutoresizingMask:NSViewWidthSizable | NSViewMinYMargin];
   [node_view addSubview:_node_community_name_field];
 
@@ -1383,7 +1551,7 @@ bool write_developer_mode_flag(const std::string& file_path, bool enabled) {
   [settings_view addSubview:_settings_dev_mode_button];
 
   _settings_recover_path_field = [[NSTextField alloc] initWithFrame:NSMakeRect(0.0, frame.size.height - 56.0, frame.size.width - 420.0, 24.0)];
-  [_settings_recover_path_field setStringValue:@"backup/identity-backup.dat"];
+  [_settings_recover_path_field setPlaceholderString:@"Backup path"];
   [_settings_recover_path_field setAutoresizingMask:NSViewWidthSizable | NSViewMinYMargin];
   [settings_view addSubview:_settings_recover_path_field];
 
@@ -1479,8 +1647,7 @@ bool write_developer_mode_flag(const std::string& file_path, bool enabled) {
   [_close_button setAutoresizingMask:NSViewMinXMargin | NSViewMinYMargin];
   [content addSubview:_close_button];
 
-  const CGFloat body_h = _developer_mode ? (NSHeight(bounds) - (margin * 3.0) - top_h)
-                                         : (NSHeight(bounds) - (margin * 2.0));
+  const CGFloat body_h = NSHeight(bounds) - (margin * 3.0) - top_h;
   const CGFloat body_top = margin + body_h;
 
   _parent_menu = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(margin, body_top - combo_h, left_w, combo_h)
@@ -1591,10 +1758,12 @@ bool write_developer_mode_flag(const std::string& file_path, bool enabled) {
                                     node.genesis.network_id)];
   [content addSubview:meta];
 
-  [splash makeKeyAndOrderFront:nil];
+  [splash orderFront:nil];
   [NSApp activateIgnoringOtherApps:YES];
-  [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:1.2]];
-  [splash orderOut:nil];
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, static_cast<int64_t>(1.2 * NSEC_PER_SEC)),
+                 dispatch_get_main_queue(), ^{
+                   [splash orderOut:nil];
+                 });
 }
 
 - (void)bootstrapDemoData {
@@ -1630,6 +1799,7 @@ bool write_developer_mode_flag(const std::string& file_path, bool enabled) {
   (void)notification;
 
   _developer_mode = false;
+  _receive_private_key_visible = false;
   _live_timer = nil;
   _api = std::make_unique<alpha::CoreApi>();
   const std::string app_data_dir = default_app_data_dir();
@@ -1637,8 +1807,8 @@ bool write_developer_mode_flag(const std::string& file_path, bool enabled) {
       .app_data_dir = app_data_dir,
       .passphrase = "soupnet-dev-passphrase",
       .mode = alpha::AnonymityMode::Tor,
-      .seed_peers = {"seed.got-soup.local:4001", "24.188.147.247:4001"},
-      .seed_peers_mainnet = {"seed.got-soup.local:4001", "24.188.147.247:4001"},
+      .seed_peers = {"24.188.147.247:4001"},
+      .seed_peers_mainnet = {"24.188.147.247:4001"},
       .seed_peers_testnet = {"seed.got-soup.local:14001"},
       .alpha_test_mode = false,
       .peers_dat_path = {},
@@ -1686,13 +1856,9 @@ bool write_developer_mode_flag(const std::string& file_path, bool enabled) {
   }
 
   if (!init.ok) {
-    NSAlert* alert = [[NSAlert alloc] init];
-    [alert setMessageText:@"Initialization Error"];
     const std::string details = init.message + "\n\nApp data dir:\n" + app_data_dir;
-    [alert setInformativeText:to_ns_string(details)];
-    [alert addButtonWithTitle:@"Exit"];
-    [alert runModal];
-    [NSApp terminate:nil];
+    std::fprintf(stderr, "Initialization Error\n%s\n", details.c_str());
+    show_error_alert(_window, "Initialization Error", details);
     return;
   }
 
@@ -1774,6 +1940,22 @@ bool write_developer_mode_flag(const std::string& file_path, bool enabled) {
   [self rebuildOpeningList];
 }
 
+- (void)onRecipeSelectionChanged:(id)sender {
+  (void)sender;
+  if (_suppress_picker_actions) {
+    return;
+  }
+  [self refreshRecipesTab];
+}
+
+- (void)onForumThreadSelectionChanged:(id)sender {
+  (void)sender;
+  if (_suppress_picker_actions) {
+    return;
+  }
+  [self refreshForumTab];
+}
+
 - (void)onParentMenuChanged:(id)sender {
   (void)sender;
   [self rebuildSecondaryMenu];
@@ -1788,9 +1970,13 @@ bool write_developer_mode_flag(const std::string& file_path, bool enabled) {
 - (void)onUploadRecipe:(id)sender {
   (void)sender;
 
-  const std::string title = from_ns_string([_upload_title stringValue]);
-  const std::string category = from_ns_string([_upload_category stringValue]);
-  const std::string body = from_ns_string([_upload_body string]);
+  const std::string title = trim_copy(from_ns_string([_upload_title stringValue]));
+  const std::string category = trim_copy(from_ns_string([_upload_category stringValue]));
+  const std::string body = trim_copy(from_ns_string([_upload_body string]));
+  if (title.empty() || category.empty() || body.empty()) {
+    show_error_alert(_window, "Upload Recipe", "Recipe title, category, and markdown are required.");
+    return;
+  }
 
   const alpha::Result result = _api->create_recipe({
       .category = category,
@@ -1820,12 +2006,13 @@ bool write_developer_mode_flag(const std::string& file_path, bool enabled) {
 - (void)onRecipesThumbUp:(id)sender {
   (void)sender;
 
-  if (_recipes.empty()) {
+  const alpha::RecipeSummary* recipe = [self selectedRecipe];
+  if (recipe == nullptr) {
     show_error_alert(_window, "Thumbs Up", "No recipe is currently selected by search/filter.");
     return;
   }
 
-  const alpha::Result result = _api->add_thumb_up(_recipes.front().recipe_id);
+  const alpha::Result result = _api->add_thumb_up(recipe->recipe_id);
   if (!result.ok) {
     show_error_alert(_window, "Thumbs Up", result.message);
     return;
@@ -1840,7 +2027,8 @@ bool write_developer_mode_flag(const std::string& file_path, bool enabled) {
 - (void)onRecipesRate:(id)sender {
   (void)sender;
 
-  if (_recipes.empty()) {
+  const alpha::RecipeSummary* recipe = [self selectedRecipe];
+  if (recipe == nullptr) {
     show_error_alert(_window, "Rate Recipe", "No recipe is currently selected by search/filter.");
     return;
   }
@@ -1856,7 +2044,7 @@ bool write_developer_mode_flag(const std::string& file_path, bool enabled) {
   }
 
   const alpha::Result result = _api->add_review({
-      .recipe_id = _recipes.front().recipe_id,
+      .recipe_id = recipe->recipe_id,
       .rating = rating,
       .markdown = "Rated via UI",
   });
@@ -1874,17 +2062,21 @@ bool write_developer_mode_flag(const std::string& file_path, bool enabled) {
 - (void)onCreateForumThread:(id)sender {
   (void)sender;
 
-  if (_recipes.empty()) {
+  const alpha::RecipeSummary* recipe = [self selectedRecipe];
+  if (recipe == nullptr) {
     show_error_alert(_window, "Create Thread", "No recipe selected. Create or search a recipe first.");
     return;
   }
 
-  const auto& recipe = _recipes.front();
-  const std::string title = from_ns_string([_forum_thread_title stringValue]);
-  const std::string body = from_ns_string([_forum_thread_body string]);
+  const std::string title = trim_copy(from_ns_string([_forum_thread_title stringValue]));
+  const std::string body = trim_copy(from_ns_string([_forum_thread_body string]));
+  if (title.empty() || body.empty()) {
+    show_error_alert(_window, "Create Thread", "Thread title and body are required.");
+    return;
+  }
 
   const alpha::Result result = _api->create_thread({
-      .recipe_id = recipe.recipe_id,
+      .recipe_id = recipe->recipe_id,
       .title = title,
       .markdown = body,
   });
@@ -1903,21 +2095,25 @@ bool write_developer_mode_flag(const std::string& file_path, bool enabled) {
 - (void)onCreateForumReply:(id)sender {
   (void)sender;
 
-  if (_recipes.empty()) {
+  const alpha::RecipeSummary* recipe = [self selectedRecipe];
+  if (recipe == nullptr) {
     show_error_alert(_window, "Create Reply", "No recipe selected. Create or search a recipe first.");
     return;
   }
 
-  const auto& recipe = _recipes.front();
-  const auto threads = _api->threads(recipe.recipe_id);
-  if (threads.empty()) {
+  const alpha::ThreadSummary* thread = [self selectedThread];
+  if (thread == nullptr) {
     show_error_alert(_window, "Create Reply", "No thread exists yet for this recipe.");
     return;
   }
 
-  const std::string body = from_ns_string([_forum_reply_body string]);
+  const std::string body = trim_copy(from_ns_string([_forum_reply_body string]));
+  if (body.empty()) {
+    show_error_alert(_window, "Create Reply", "Reply body is required.");
+    return;
+  }
   const alpha::Result result = _api->create_reply({
-      .thread_id = threads.front().thread_id,
+      .thread_id = thread->thread_id,
       .markdown = body,
   });
   if (!result.ok) {
@@ -1934,9 +2130,9 @@ bool write_developer_mode_flag(const std::string& file_path, bool enabled) {
 - (void)onSendToAddress:(id)sender {
   (void)sender;
 
-  const std::string address = from_ns_string([_send_address_field stringValue]);
-  const std::string amount_text = from_ns_string([_send_amount_field stringValue]);
-  const std::string memo = from_ns_string([_send_memo_field stringValue]);
+  const std::string address = trim_copy(from_ns_string([_send_address_field stringValue]));
+  const std::string amount_text = trim_copy(from_ns_string([_send_amount_field stringValue]));
+  const std::string memo = trim_copy(from_ns_string([_send_memo_field stringValue]));
   if (address.empty() || amount_text.empty()) {
     show_error_alert(_window, "Send", "Address and amount are required.");
     return;
@@ -2038,7 +2234,11 @@ bool write_developer_mode_flag(const std::string& file_path, bool enabled) {
 - (void)onNodeAddPeer:(id)sender {
   (void)sender;
 
-  const std::string peer = from_ns_string([_node_peer_field stringValue]);
+  const std::string peer = trim_copy(from_ns_string([_node_peer_field stringValue]));
+  if (peer.empty()) {
+    show_error_alert(_window, "Add Peer", "Peer host:port is required.");
+    return;
+  }
   const alpha::Result result = _api->add_peer(peer);
   if (!result.ok) {
     show_error_alert(_window, "Add Peer", result.message);
@@ -2052,8 +2252,12 @@ bool write_developer_mode_flag(const std::string& file_path, bool enabled) {
 - (void)onNodeUseCommunity:(id)sender {
   (void)sender;
 
-  const std::string community_id = from_ns_string([_node_community_id_field stringValue]);
-  const std::string community_name = from_ns_string([_node_community_name_field stringValue]);
+  const std::string community_id = trim_copy(from_ns_string([_node_community_id_field stringValue]));
+  const std::string community_name = trim_copy(from_ns_string([_node_community_name_field stringValue]));
+  if (community_id.empty() || community_name.empty()) {
+    show_error_alert(_window, "Community Profile", "Community ID and community name are required.");
+    return;
+  }
 
   const alpha::Result result = _api->use_community_profile(community_id, community_name, "");
   if (!result.ok) {
@@ -2070,9 +2274,13 @@ bool write_developer_mode_flag(const std::string& file_path, bool enabled) {
 - (void)onProfileSetName:(id)sender {
   (void)sender;
 
-  const std::string display_name = from_ns_string([_profile_name_field stringValue]);
+  const std::string display_name = trim_copy(from_ns_string([_profile_name_field stringValue]));
   const std::string cipher_password = from_ns_string([_profile_cipher_password_field stringValue]);
-  const std::string cipher_salt = from_ns_string([_profile_cipher_salt_field stringValue]);
+  const std::string cipher_salt = trim_copy(from_ns_string([_profile_cipher_salt_field stringValue]));
+  if (display_name.empty()) {
+    show_error_alert(_window, "Set Immortal", "Display name is required.");
+    return;
+  }
   const alpha::Result result =
       _api->set_immortal_name_with_cipher(display_name, cipher_password, cipher_salt);
   if (!result.ok) {
@@ -2102,7 +2310,11 @@ bool write_developer_mode_flag(const std::string& file_path, bool enabled) {
   (void)sender;
 
   const std::string password = from_ns_string([_profile_cipher_password_field stringValue]);
-  const std::string salt = from_ns_string([_profile_cipher_salt_field stringValue]);
+  const std::string salt = trim_copy(from_ns_string([_profile_cipher_salt_field stringValue]));
+  if (password.empty() || salt.empty()) {
+    show_error_alert(_window, "Cipher Key", "Cipher password and salt are required.");
+    return;
+  }
   const alpha::Result result = _api->set_profile_cipher_password(password, salt);
   if (!result.ok) {
     show_error_alert(_window, "Cipher Key", result.message);
@@ -2130,9 +2342,13 @@ bool write_developer_mode_flag(const std::string& file_path, bool enabled) {
 - (void)onProfileExportKey:(id)sender {
   (void)sender;
 
-  const std::string path = from_ns_string([_profile_export_path_field stringValue]);
+  const std::string path = trim_copy(from_ns_string([_profile_export_path_field stringValue]));
   const std::string password = from_ns_string([_profile_export_password_field stringValue]);
-  const std::string salt = from_ns_string([_profile_export_salt_field stringValue]);
+  const std::string salt = trim_copy(from_ns_string([_profile_export_salt_field stringValue]));
+  if (path.empty() || password.empty() || salt.empty()) {
+    show_error_alert(_window, "Export Key", "Backup path, password, and salt are required.");
+    return;
+  }
 
   const alpha::Result result = _api->export_key_backup(path, password, salt);
   if (!result.ok) {
@@ -2150,8 +2366,12 @@ bool write_developer_mode_flag(const std::string& file_path, bool enabled) {
 - (void)onProfileImportKey:(id)sender {
   (void)sender;
 
-  const std::string path = from_ns_string([_profile_import_path_field stringValue]);
+  const std::string path = trim_copy(from_ns_string([_profile_import_path_field stringValue]));
   const std::string password = from_ns_string([_profile_import_password_field stringValue]);
+  if (path.empty() || password.empty()) {
+    show_error_alert(_window, "Import Key", "Backup path and password are required.");
+    return;
+  }
   const alpha::Result result = _api->import_key_backup(path, password);
   if (!result.ok) {
     show_error_alert(_window, "Import Key", result.message);
@@ -2203,6 +2423,10 @@ bool write_developer_mode_flag(const std::string& file_path, bool enabled) {
 - (void)onSettingsUnlockWallet:(id)sender {
   (void)sender;
   const std::string pass = from_ns_string([_settings_unlock_password_field stringValue]);
+  if (pass.empty()) {
+    show_error_alert(_window, "Unlock Wallet", "Unlock passphrase is required.");
+    return;
+  }
   const alpha::Result result = _api->unlock_wallet(pass);
   if (!result.ok) {
     show_error_alert(_window, "Unlock Wallet", result.message);
@@ -2215,9 +2439,13 @@ bool write_developer_mode_flag(const std::string& file_path, bool enabled) {
 
 - (void)onSettingsRecoverWallet:(id)sender {
   (void)sender;
-  const std::string path = from_ns_string([_settings_recover_path_field stringValue]);
+  const std::string path = trim_copy(from_ns_string([_settings_recover_path_field stringValue]));
   const std::string backup_pass = from_ns_string([_settings_recover_backup_password_field stringValue]);
   const std::string local_pass = from_ns_string([_settings_recover_local_password_field stringValue]);
+  if (path.empty() || backup_pass.empty() || local_pass.empty()) {
+    show_error_alert(_window, "Recover Wallet", "Recovery path, backup password, and new local password are required.");
+    return;
+  }
   const alpha::Result result = _api->recover_wallet(path, backup_pass, local_pass);
   if (!result.ok) {
     show_error_alert(_window, "Recover Wallet", result.message);
@@ -2255,6 +2483,12 @@ bool write_developer_mode_flag(const std::string& file_path, bool enabled) {
   [alert setInformativeText:to_ns_string(msg)];
   [alert addButtonWithTitle:@"OK"];
   [alert beginSheetModalForWindow:_window completionHandler:nil];
+}
+
+- (void)onToggleReceivePrivateKey:(id)sender {
+  (void)sender;
+  _receive_private_key_visible = !_receive_private_key_visible;
+  [self refreshSendReceiveTransactionsTabs];
 }
 
 - (void)onClose:(id)sender {
